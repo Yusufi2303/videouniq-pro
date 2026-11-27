@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.cache/
+tmp/
+Output_*/
+vendor/ffmpeg/win64/
+python-embed/
+wheels/
