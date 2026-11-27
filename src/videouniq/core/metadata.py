@@ -26,14 +26,18 @@ def creation_timestamp(params: UniqueParams, now: datetime | None = None) -> dat
 def metadata_pairs(params: UniqueParams, now: datetime | None = None) -> list[tuple[str, str]]:
     created = creation_timestamp(params, now).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
     label = DEVICE_LABELS.get(params.device_preset, params.device_preset)
+    token = (params.metadata_token or "00000000")[:12]
+    comment = f"{label} · {token}"
     pairs: list[tuple[str, str]] = [
         ("creation_time", created),
         ("date", created[:10]),
         ("title", label),
         ("artist", label),
-        ("comment", label),
-        ("synopsis", label),
+        ("comment", comment),
+        ("synopsis", comment),
         ("description", label),
+        ("grouping", token),
+        ("episode_id", token),
     ]
     preset = params.device_preset
     if preset.startswith("iphone"):
@@ -93,8 +97,17 @@ def ffmpeg_metadata_args(params: UniqueParams) -> list[str]:
     args = ["-map_metadata", "-1", "-fflags", "+bitexact"]
     if not params.write_metadata:
         return args
+    token = (params.metadata_token or "00000000")[:12]
     for key, value in metadata_pairs(params):
         if value == "":
             continue
         args.extend(["-metadata", f"{key}={value}"])
+    args.extend(
+        [
+            "-metadata:s:v",
+            f"handler_name=VideoHandler {token}",
+            "-metadata:s:a",
+            f"handler_name=SoundHandler {token}",
+        ]
+    )
     return args

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Assemble a portable Windows x64 folder: embeddable CPython + wheels + FFmpeg + app."""
+"""Assemble a portable Windows x64 folder: embeddable CPython + wheels + FFmpeg + app.
+
+Rebuild after 1.0.1 uniqueness changes so the zip matches src/videouniq.
+The previous shipped artifact is v1.0.0; next zip is v1.0.1.
+"""
 
 from __future__ import annotations
 

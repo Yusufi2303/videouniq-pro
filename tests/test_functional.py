@@ -18,7 +18,14 @@ from videouniq.core.filters import build_filter_complex
 from videouniq.core.hardware import detect_hardware
 from videouniq.core.metadata import metadata_pairs
 from videouniq.core.params import ManualRanges, ModuleFlags, flags_for_preset, ranges_for_preset
-from videouniq.core.pipeline import JobCancelled, encode_copy, extract_preview, file_md5, uniquize_source
+from videouniq.core.pipeline import (
+    JobCancelled,
+    container_output_args,
+    encode_copy,
+    extract_preview,
+    file_md5,
+    uniquize_source,
+)
 from videouniq.core.probe import collect_videos, probe_media
 from videouniq.core.randomizer import generate_unique_set, output_folder_name
 from videouniq.paths import ffmpeg_bin, ffprobe_bin
@@ -88,6 +95,95 @@ def check(cond: bool, msg: str) -> None:
         raise AssertionError(msg)
 
 
+def average_hash_bits(path: Path, t: float, size: int = 32) -> int:
+    """Mean-threshold average hash of one frame (size×size bits) — no extra deps."""
+    n = size * size
+    proc = subprocess.run(
+        [
+            ffmpeg_bin(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{t:.3f}",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={size}:{size}:flags=area,format=gray",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    data = proc.stdout
+    if len(data) != n:
+        raise RuntimeError(f"hash frame failed ({len(data)} bytes, want {n}): {proc.stderr!r}")
+    mean = sum(data) / n
+    bits = 0
+    for i, value in enumerate(data):
+        if value >= mean:
+            bits |= 1 << i
+    return bits
+
+
+def hamming_bits(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def mean_pairwise_hash_distance(
+    paths: list[Path],
+    times: tuple[float, ...] = (0.16, 0.40, 0.72),
+    size: int = 32,
+) -> tuple[float, float]:
+    pair_means: list[float] = []
+    for i in range(len(paths)):
+        for j in range(i + 1, len(paths)):
+            dists = [
+                hamming_bits(average_hash_bits(paths[i], t, size), average_hash_bits(paths[j], t, size))
+                for t in times
+            ]
+            pair_means.append(sum(dists) / len(dists))
+    if not pair_means:
+        return 0.0, 0.0
+    return sum(pair_means) / len(pair_means), min(pair_means)
+
+
+def luma_mae(src: Path, dest: Path, t: float = 0.35, scale: str = "160:90") -> float:
+    def frame(path: Path) -> bytes:
+        proc = subprocess.run(
+            [
+                ffmpeg_bin(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{t:.3f}",
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-vf",
+                f"scale={scale}:flags=area,format=gray",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        return proc.stdout
+
+    a, b = frame(src), frame(dest)
+    n = min(len(a), len(b))
+    if n == 0:
+        return 999.0
+    return sum(abs(a[i] - b[i]) for i in range(n)) / n
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -102,7 +198,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="vu-tz-"))
     sample_a = tmp / "clips" / "source_a.mp4"
     sample_b = tmp / "clips" / "nested" / "source_b.mp4"
-    make_sample(sample_a, seconds=1.0)
+    make_sample(sample_a, seconds=1.4)
     make_sample(sample_b, seconds=1.0, size="480x270", rate=25)
 
     def t_collect() -> None:
@@ -132,9 +228,37 @@ def main() -> int:
                 check(all(abs(p.tempo - 1.0) <= 0.005 + 1e-6 for p in params), "light tempo 0.5%")
                 check(all(p.audio_noise for p in params), "light noise")
                 check(all(not p.grain and not p.overlay for p in params), "light extras off")
+            if preset == "optimal":
+                check(all(p.grain and p.overlay for p in params), "optimal grain+overlay")
+                check(len({p.grain_seed for p in params}) == 5, "optimal unique grain seeds")
+                check(len({p.overlay_seed for p in params}) == 5, "optimal unique overlay seeds")
+                check(all(p.grain_strength == 1 for p in params), "optimal grain strength TZ")
+                check(all(abs(p.hue_deg) <= 1.21 for p in params), f"optimal hue { [p.hue_deg for p in params] }")
+                check(all(0.11 <= p.unsharp <= 0.29 for p in params), "optimal unsharp")
+                check(all(1.0 <= p.stereo_delay_ms <= 3.21 for p in params), "optimal stereo delay")
+                check(all(abs(p.tempo - 1.0) <= 0.012 + 1e-6 for p in params), "optimal tempo TZ")
+                check(all(abs(p.pitch_semitones) <= 0.15 + 1e-6 for p in params), "optimal pitch TZ")
+                check(len({p.gop_size for p in params}) >= 2, "optimal GOP diversity")
+                check(len({p.metadata_token for p in params}) == 5, "optimal unique metadata tokens")
+                check(len({p.noise_seed for p in params}) == 5, "optimal unique noise seeds")
+                graph = build_filter_complex(info, params[0])
+                check("all_seed=" in graph, graph)
+                check("anoisesrc=" in graph and "seed=" in graph, graph)
+                check("equalizer=" in graph, graph)
+                check("adelay=" in graph, graph)
+                check("hue=h=" in graph, graph)
+                check("unsharp=" in graph, graph)
+                check("color=c=" in graph, "temporal overlay source")
+                args = container_output_args(params[0], "cpu")
+                check("-g" in args and "-force_key_frames" in args, args)
             if preset == "hard":
                 check(any(p.hflip or abs(p.rotate_deg) > 0 for p in params) or True, "hard modules")
                 check(all(p.crop_pct >= 1.0 for p in params), "hard crop")
+                check(all(p.grain_strength in {1, 2} for p in params), "hard grain")
+                check(all(abs(p.hue_deg) <= 2.61 for p in params), "hard hue")
+                check(all(1.0 <= p.stereo_delay_ms <= 4.01 for p in params), "hard stereo delay TZ")
+                check(all(abs(p.tempo - 1.0) <= 0.015 + 1e-6 for p in params), "hard tempo TZ")
+                check(all(abs(p.pitch_semitones) <= 0.2 + 1e-6 for p in params), "hard pitch TZ")
 
         flags = ModuleFlags(
             metadata=True,
@@ -245,6 +369,43 @@ def main() -> int:
         check(cpu.kind == "cpu" and cpu.video_codec == "libx264", cpu)
         check(auto.video_codec in {"libx264", "h264_nvenc", "h264_qsv", "h264_amf"}, auto)
 
+    def t_perceptual_and_quality() -> None:
+        info = probe_media(sample_a)
+        encoder = detect_hardware("cpu")
+        copies = generate_unique_set(info, 4, "optimal")
+        check(len({p.fingerprint() for p in copies}) == 4, "fingerprints")
+        dest_dir = tmp / "perceptual"
+        written = uniquize_source(info, copies, dest_dir, encoder, x264_threads=2)
+        hashes = [file_md5(p) for p in written]
+        check(len(set(hashes)) == 4, f"MD5 collision {hashes}")
+        check(file_md5(sample_a) not in hashes, "copies differ from source MD5")
+        mean_hd, min_hd = mean_pairwise_hash_distance(written, size=32)
+        print(f"  perceptual 32x32 aHash pairwise mean={mean_hd:.2f} min={min_hd:.2f} (of 1024)")
+        check(mean_hd >= 10.0, f"pHash mean Hamming too low: {mean_hd:.2f}")
+        check(min_hd >= 3.0, f"pHash min Hamming too low: {min_hd:.2f}")
+        maes = [luma_mae(sample_a, path) for path in written]
+        mae8 = [luma_mae(sample_a, path, scale="8:8") for path in written]
+        print(f"  luma MAE 160x90 { [round(x, 2) for x in maes] }")
+        print(f"  luma MAE 8x8    { [round(x, 2) for x in mae8] }")
+        # 160×90 MAE is inflated by 0.5–1.6% crop on high-contrast testsrc2 edges;
+        # 8×8 MAE checks that the frame still looks like the same shot.
+        check(all(x < 26.0 for x in maes), f"Optimal copy looks too far from source: {maes}")
+        check(sum(maes) / len(maes) < 24.0, f"Optimal mean MAE {sum(maes)/len(maes):.2f}")
+        check(all(x < 18.0 for x in mae8), f"Optimal 8x8 structure MAE {mae8}")
+        gops = [p.gop_size for p in copies]
+        check(len(set(gops)) >= 2, gops)
+        tokens = {p.metadata_token for p in copies}
+        check(len(tokens) == 4, tokens)
+
+    def t_many_fingerprints() -> None:
+        info = probe_media(sample_a)
+        params = generate_unique_set(info, 24, "optimal")
+        fps = [p.fingerprint() for p in params]
+        check(len(set(fps)) == 24, "duplicate parameter set in 24 Optimal copies")
+        check(len({p.grain_seed for p in params}) == 24, "grain seed collision")
+        check(len({p.overlay_seed for p in params}) == 24, "overlay seed collision")
+        check(len({p.noise_seed for p in params}) == 24, "audio noise seed collision")
+
     step("folder collect (drag-drop equivalent)", t_collect)
     step("probe + first-frame preview", t_probe_preview)
     step("unique params Light/Optimal/Hard/Manual", t_presets_unique)
@@ -254,6 +415,8 @@ def main() -> int:
     step("per-source output folders", t_two_sources)
     step("render stop", t_stop)
     step("GPU/CPU encoder setting", t_hw_cpu)
+    step("MD5 + perceptual hash + Optimal quality", t_perceptual_and_quality)
+    step("no duplicate param sets (24 copies)", t_many_fingerprints)
 
     print("TMP", tmp)
     if failures:

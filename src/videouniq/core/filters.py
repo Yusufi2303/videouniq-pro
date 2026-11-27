@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+from videouniq.core.overlay import temporal_overlay_chain
 from videouniq.core.params import UniqueParams
 from videouniq.core.probe import MediaInfo
 
@@ -23,10 +24,27 @@ def rotation_zoom(angle_deg: float, width: int, height: int) -> float:
 def output_duration(media: MediaInfo, params: UniqueParams) -> float:
     trimmed = max(0.2, media.duration - params.trim_start - params.trim_end)
     tempo = params.tempo if params.tempo > 0 else 1.0
-    return trimmed / tempo
+    extra = max(0.0, params.aac_priming_ms) / 1000.0
+    return trimmed / tempo + extra
 
 
-def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: int | None) -> str:
+def _eq_notch(freq: float | None, q: float, gain: float) -> str | None:
+    if freq is None or abs(gain) < 0.05:
+        return None
+    return f"equalizer=f={freq:.1f}:t=q:w={max(0.5, q):.2f}:g={gain:.2f}"
+
+
+def build_filter_complex(
+    media: MediaInfo,
+    params: UniqueParams,
+    overlay_input: int | None = None,
+) -> str:
+    """Build the uniquization filtergraph.
+
+    ``overlay_input`` is ignored: overlay is generated inside the graph so it
+    varies every frame instead of repeating one PNG.
+    """
+    del overlay_input
     w, h = even(media.width), even(media.height)
     v: list[str] = []
 
@@ -44,7 +62,7 @@ def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: 
     if params.hflip:
         v.append("hflip")
 
-    # Edge crop + pixel shift, then lanczos back to source resolution.
+    # Independent per-copy edge crop + pixel shift, then lanczos back to source size.
     crop_pct = max(0.0, params.crop_pct) / 100.0
     need_crop = crop_pct > 0 or params.shift_x or params.shift_y
     if need_crop:
@@ -75,7 +93,6 @@ def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: 
             zh = even(h + 4)
         v.append(f"scale={zw}:{zh}:flags=lanczos")
         rad = f"{math.radians(params.rotate_deg):.8f}"
-        # Keep the zoomed frame size; auto-zoom already covers black corners.
         v.append(f"rotate={rad}:ow=iw:oh=ih:c=black:bilinear=1")
         v.append(f"crop={w}:{h}:(iw-{w})/2:(ih-{h})/2")
 
@@ -91,8 +108,20 @@ def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: 
     if eq_bits:
         v.append("eq=" + ":".join(eq_bits))
 
+    if abs(params.hue_deg) > 0.01:
+        v.append(f"hue=h={params.hue_deg:.3f}")
+
+    if abs(params.unsharp) > 0.02:
+        amount = max(-0.8, min(0.8, params.unsharp))
+        v.append(f"unsharp=lx=5:ly=5:la={amount:.3f}:ca=0")
+
     if params.grain:
-        v.append("noise=alls=1:allf=t")
+        strength = max(1, min(3, int(params.grain_strength or 1)))
+        seed = max(1, int(params.grain_seed) & 0x7FFFFFFF)
+        c0, c1, c2 = seed, (seed + 41) & 0x7FFFFFFF, (seed + 73) & 0x7FFFFFFF
+        v.append(
+            f"noise=alls={strength}:allf=t:all_seed={seed}:c0_seed={c0}:c1_seed={c1}:c2_seed={c2}"
+        )
 
     if params.fps_target and params.fps_target > 1:
         v.append(f"fps={params.fps_target:.4f}")
@@ -104,12 +133,19 @@ def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: 
     video_chain = ",".join(v) if v else "null"
 
     parts: list[str] = []
-    if overlay_input is not None and params.overlay:
-        parts.append(f"[0:v]{video_chain}[vbase]")
-        parts.append(
-            f"[{overlay_input}:v]scale={w}:{h}:flags=neighbor,format=rgba,colorchannelmixer=aa=0.01[ov]"
+    if params.overlay:
+        ov = temporal_overlay_chain(
+            w,
+            h,
+            media.fps or 30.0,
+            params.overlay_seed or 1,
+            params.overlay_strength or 8,
+            opacity=0.012 if params.overlay_strength >= 14 else 0.01,
+            duration=max(1.0, output_duration(media, params) + 0.5),
         )
-        parts.append("[vbase][ov]overlay=0:0:format=auto:repeatlast=1[vout]")
+        parts.append(f"[0:v]{video_chain}[vbase]")
+        parts.append(f"{ov}[ov]")
+        parts.append("[vbase][ov]overlay=0:0:format=auto:shortest=1,format=yuv420p[vout]")
     else:
         parts.append(f"[0:v]{video_chain}[vout]")
 
@@ -134,15 +170,34 @@ def build_filter_complex(media: MediaInfo, params: UniqueParams, overlay_input: 
             a.append(f"highpass=f={params.highpass_hz:.1f}")
         if params.lowpass_hz:
             a.append(f"lowpass=f={params.lowpass_hz:.0f}")
+        notch = _eq_notch(params.eq_notch_hz, params.eq_notch_q, params.eq_notch_gain)
+        if notch:
+            a.append(notch)
+        notch2 = _eq_notch(params.eq_notch2_hz, params.eq_notch2_q, params.eq_notch2_gain)
+        if notch2:
+            a.append(notch2)
         a.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
+
+        priming = max(0.0, float(params.aac_priming_ms))
+        stereo = max(0.0, min(4.0, float(params.stereo_delay_ms)))
+        if priming > 0 or stereo > 0:
+            if params.stereo_delay_on_left:
+                left, right = priming + stereo, priming
+            else:
+                left, right = priming, priming + stereo
+            a.append(f"adelay={left:.2f}|{right:.2f}:all=1")
         audio_chain = ",".join(a) if a else "anull"
 
         if params.audio_noise:
             duration = max(0.25, output_duration(media, params))
             color = "pink" if params.noise_color == "pink" else "white"
+            seed = max(1, int(params.noise_seed) & 0x7FFFFFFF)
             parts.append(f"[0:a]{audio_chain}[a1]")
             parts.append(
-                f"anoisesrc=color={color}:amplitude=0.003162:sample_rate=48000:duration={duration:.4f}[ano]"
+                "anoisesrc="
+                f"color={color}:amplitude=0.003162:sample_rate=48000:"
+                f"duration={duration:.4f}:seed={seed},"
+                "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[ano]"
             )
             parts.append("[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,volume=1[aout]")
         else:
