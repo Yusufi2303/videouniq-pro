@@ -11,6 +11,8 @@ from videouniq.core.hardware import EncoderChoice
 from videouniq.core.params import UniqueParams
 from videouniq.core.pipeline import JobCancelled, encode_copy, file_md5
 from videouniq.core.probe import MediaInfo
+from videouniq.editor.filtergraph import build_edit_and_uniquize
+from videouniq.editor.project import EditorProject
 from videouniq.queue.models import CopyJob, FileItem
 
 
@@ -45,6 +47,7 @@ class RenderController(QObject):
         output_root: Path,
         encoder: EncoderChoice,
         parallel: int,
+        save_master: bool = False,
     ) -> int:
         if self._running:
             return 0
@@ -64,8 +67,24 @@ class RenderController(QObject):
             item.copies_total = len(copies)
             item.copies_done = 0
             self._hashes[item.item_id] = set()
-            self._pending[item.item_id] = len(copies)
+            extra = 1 if (save_master and item.kind == "project" and item.project_dict) else 0
+            self._pending[item.item_id] = len(copies) + extra
             self._failed[item.item_id] = 0
+            if extra:
+                master_params = UniqueParams(write_metadata=False, pad_bytes=24)
+                jobs.append(
+                    CopyJob(
+                        item_id=item.item_id,
+                        source_path=item.path,
+                        copy_index=0,
+                        copies_total=len(copies),
+                        dest=str(folder / "master.mp4"),
+                        params=master_params,
+                        media=item.info,
+                        project_dict=item.project_dict,
+                        is_master=True,
+                    )
+                )
             for idx, params in enumerate(copies, start=1):
                 jobs.append(
                     CopyJob(
@@ -76,6 +95,7 @@ class RenderController(QObject):
                         dest=str(folder / f"video_{idx}.mp4"),
                         params=params,
                         media=item.info,
+                        project_dict=item.project_dict,
                     )
                 )
 
@@ -135,15 +155,23 @@ class RenderController(QObject):
                 def _cb(frac: float, stage: str, item_id=job.item_id, idx=job.copy_index) -> None:
                     self.job_progress.emit(item_id, idx, frac, stage)
 
+                graph_spec = None
+                run_params = params
+                if job.project_dict:
+                    project = EditorProject.from_dict(job.project_dict)
+                    graph_spec = build_edit_and_uniquize(
+                        project, None if job.is_master else run_params
+                    )
                 encode_copy(
                     job.media,
-                    params,
+                    run_params,
                     job.dest,
                     encoder,
                     stop_event=self._stop,
                     progress_cb=_cb,
                     log_cb=lambda m: self.log_line.emit(m),
                     x264_threads=x264_threads,
+                    graph_spec=graph_spec,
                 )
                 digest = file_md5(job.dest)
                 with self._lock:

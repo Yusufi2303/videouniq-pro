@@ -29,6 +29,9 @@ class FileItem:
     error: str = ""
     output_dir: str = ""
     message: str = ""
+    kind: str = "video"  # video | project
+    project_path: str = ""
+    project_dict: dict | None = None
 
 
 @dataclass
@@ -40,3 +43,6 @@ class CopyJob:
     dest: str
     params: UniqueParams
     media: MediaInfo
+    project_dict: dict | None = None
+    save_master: bool = False
+    is_master: bool = False

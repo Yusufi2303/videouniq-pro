@@ -7,7 +7,9 @@ from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QSizePolicy, QVBoxLay
 from videouniq import __version__
 
 NAV = [
-    ("uniquize", "Уникализация"),
+    ("editor", "Видеоредактор"),
+    ("uniquize", "Уникализатор"),
+    ("history", "История и загрузки"),
     ("render", "Настройки рендера"),
     ("meta", "Пресеты метаданных"),
     ("logs", "Логи"),
@@ -41,7 +43,7 @@ class Sidebar(QFrame):
         self.setObjectName("Sidebar")
         self.setFixedWidth(220)
         self._buttons: dict[str, QPushButton] = {}
-        self._page = "uniquize"
+        self._page = "editor"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 16, 14, 14)
@@ -100,7 +102,7 @@ class Sidebar(QFrame):
         self._timer.timeout.connect(self._tick_load)
         self._timer.start(1000)
         self._tick_load()
-        self.set_page("uniquize", emit=False)
+        self.set_page("editor", emit=False)
 
     def set_page(self, key: str, emit: bool = True) -> None:
         self._page = key

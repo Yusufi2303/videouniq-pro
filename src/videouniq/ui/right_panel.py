@@ -154,6 +154,7 @@ class RightPanel(QFrame):
     flags_changed = Signal()
     output_changed = Signal(str)
     save_preset_requested = Signal()
+    zip_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -248,6 +249,24 @@ class RightPanel(QFrame):
         note.setWordWrap(True)
         note.setStyleSheet("color: #9CA3AF; font-size: 11px;")
         layout.addWidget(note)
+
+        master_row = QHBoxLayout()
+        master_lab = QLabel("Чистый мастер проекта")
+        master_lab.setStyleSheet("font-size: 13px;")
+        self.master_toggle = ToggleSwitch(False)
+        master_row.addWidget(master_lab, 1)
+        master_row.addWidget(self.master_toggle)
+        layout.addLayout(master_row)
+        master_hint = QLabel("Для проектов редактора: дополнительно сохранить master.mp4 без уникализации, в том же проходе очереди.")
+        master_hint.setWordWrap(True)
+        master_hint.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+        layout.addWidget(master_hint)
+
+        self.zip_btn = QPushButton("ZIP готовых копий")
+        self.zip_btn.setObjectName("GhostButton")
+        self.zip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.zip_btn.clicked.connect(self.zip_requested.emit)
+        layout.addWidget(self.zip_btn)
 
         layout.addStretch(1)
         self._scroll.setWidget(host)
@@ -358,6 +377,9 @@ class RightPanel(QFrame):
 
     def copy_count(self) -> int:
         return int(self.copies_spin.value())
+
+    def save_master(self) -> bool:
+        return bool(self.master_toggle.isChecked())
 
     def output_dir(self) -> str:
         return self.out_edit.text().strip()
