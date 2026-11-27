@@ -34,20 +34,17 @@ def _eq_notch(freq: float | None, q: float, gain: float) -> str | None:
     return f"equalizer=f={freq:.1f}:t=q:w={max(0.5, q):.2f}:g={gain:.2f}"
 
 
-def build_filter_complex(
-    media: MediaInfo,
-    params: UniqueParams,
-    overlay_input: int | None = None,
-) -> str:
-    """Build the uniquization filtergraph.
+def _label(name: str) -> str:
+    s = (name or "").strip()
+    if s.startswith("[") and s.endswith("]"):
+        return s
+    return f"[{s}]"
 
-    ``overlay_input`` is ignored: overlay is generated inside the graph so it
-    varies every frame instead of repeating one PNG.
-    """
-    del overlay_input
+
+def video_uniquize_filters(media: MediaInfo, params: UniqueParams) -> tuple[list[str], float | None]:
+    """Video uniquize chain (no labels) plus optional trim end timestamp."""
     w, h = even(media.width), even(media.height)
     v: list[str] = []
-
     end = None
     if params.trim_start > 0 or params.trim_end > 0:
         start = max(0.0, params.trim_start)
@@ -62,7 +59,6 @@ def build_filter_complex(
     if params.hflip:
         v.append("hflip")
 
-    # Independent per-copy edge crop + pixel shift, then lanczos back to source size.
     crop_pct = max(0.0, params.crop_pct) / 100.0
     need_crop = crop_pct > 0 or params.shift_x or params.shift_y
     if need_crop:
@@ -130,8 +126,63 @@ def build_filter_complex(
         v.append(f"setpts=PTS/{params.tempo:.5f}")
 
     v.append("format=yuv420p")
-    video_chain = ",".join(v) if v else "null"
+    return v, end
 
+
+def audio_uniquize_filters(media: MediaInfo, params: UniqueParams, end: float | None) -> list[str]:
+    a: list[str] = []
+    if params.trim_start > 0 or params.trim_end > 0:
+        if end is not None:
+            a.append(f"atrim=start={max(0.0, params.trim_start):.4f}:end={end:.4f}")
+        else:
+            a.append(f"atrim=start={max(0.0, params.trim_start):.4f}")
+        a.append("asetpts=PTS-STARTPTS")
+
+    rate = 48000
+    pitch_ratio = 2 ** (params.pitch_semitones / 12.0) if abs(params.pitch_semitones) > 1e-6 else 1.0
+    if abs(pitch_ratio - 1.0) > 1e-6:
+        a.append(f"asetrate={rate}*{pitch_ratio:.8f}")
+        a.append(f"aresample={rate}")
+    atempo = params.tempo / pitch_ratio
+    if abs(atempo - 1.0) > 1e-4:
+        a.append(f"atempo={atempo:.5f}")
+    if params.highpass_hz:
+        a.append(f"highpass=f={params.highpass_hz:.1f}")
+    if params.lowpass_hz:
+        a.append(f"lowpass=f={params.lowpass_hz:.0f}")
+    notch = _eq_notch(params.eq_notch_hz, params.eq_notch_q, params.eq_notch_gain)
+    if notch:
+        a.append(notch)
+    notch2 = _eq_notch(params.eq_notch2_hz, params.eq_notch2_q, params.eq_notch2_gain)
+    if notch2:
+        a.append(notch2)
+    a.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
+
+    priming = max(0.0, float(params.aac_priming_ms))
+    stereo = max(0.0, min(4.0, float(params.stereo_delay_ms)))
+    if priming > 0 or stereo > 0:
+        if params.stereo_delay_on_left:
+            left, right = priming + stereo, priming
+        else:
+            left, right = priming, priming + stereo
+        a.append(f"adelay={left:.2f}|{right:.2f}:all=1")
+    return a
+
+
+def uniquize_labeled(
+    media: MediaInfo,
+    params: UniqueParams,
+    v_in: str = "0:v",
+    a_in: str | None = "0:a",
+    v_out: str = "vout",
+    a_out: str = "aout",
+) -> str:
+    """Uniquize filtergraph from labeled pads to ``vout`` / ``aout``."""
+    w, h = even(media.width), even(media.height)
+    v, end = video_uniquize_filters(media, params)
+    video_chain = ",".join(v) if v else "null"
+    vin = _label(v_in)
+    vout = v_out.strip("[]")
     parts: list[str] = []
     if params.overlay:
         ov = temporal_overlay_chain(
@@ -143,64 +194,47 @@ def build_filter_complex(
             opacity=0.012 if params.overlay_strength >= 14 else 0.01,
             duration=max(1.0, output_duration(media, params) + 0.5),
         )
-        parts.append(f"[0:v]{video_chain}[vbase]")
+        parts.append(f"{vin}{video_chain}[vbase]")
         parts.append(f"{ov}[ov]")
-        parts.append("[vbase][ov]overlay=0:0:format=auto:shortest=1,format=yuv420p[vout]")
+        parts.append(f"[vbase][ov]overlay=0:0:format=auto:shortest=1,format=yuv420p[{vout}]")
     else:
-        parts.append(f"[0:v]{video_chain}[vout]")
+        parts.append(f"{vin}{video_chain}[{vout}]")
 
-    if media.has_audio:
-        a: list[str] = []
-        if params.trim_start > 0 or params.trim_end > 0:
-            if end is not None:
-                a.append(f"atrim=start={max(0.0, params.trim_start):.4f}:end={end:.4f}")
-            else:
-                a.append(f"atrim=start={max(0.0, params.trim_start):.4f}")
-            a.append("asetpts=PTS-STARTPTS")
-
-        rate = 48000
-        pitch_ratio = 2 ** (params.pitch_semitones / 12.0) if abs(params.pitch_semitones) > 1e-6 else 1.0
-        if abs(pitch_ratio - 1.0) > 1e-6:
-            a.append(f"asetrate={rate}*{pitch_ratio:.8f}")
-            a.append(f"aresample={rate}")
-        atempo = params.tempo / pitch_ratio
-        if abs(atempo - 1.0) > 1e-4:
-            a.append(f"atempo={atempo:.5f}")
-        if params.highpass_hz:
-            a.append(f"highpass=f={params.highpass_hz:.1f}")
-        if params.lowpass_hz:
-            a.append(f"lowpass=f={params.lowpass_hz:.0f}")
-        notch = _eq_notch(params.eq_notch_hz, params.eq_notch_q, params.eq_notch_gain)
-        if notch:
-            a.append(notch)
-        notch2 = _eq_notch(params.eq_notch2_hz, params.eq_notch2_q, params.eq_notch2_gain)
-        if notch2:
-            a.append(notch2)
-        a.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
-
-        priming = max(0.0, float(params.aac_priming_ms))
-        stereo = max(0.0, min(4.0, float(params.stereo_delay_ms)))
-        if priming > 0 or stereo > 0:
-            if params.stereo_delay_on_left:
-                left, right = priming + stereo, priming
-            else:
-                left, right = priming, priming + stereo
-            a.append(f"adelay={left:.2f}|{right:.2f}:all=1")
+    has_audio = bool(media.has_audio and a_in)
+    if has_audio:
+        a = audio_uniquize_filters(media, params, end)
         audio_chain = ",".join(a) if a else "anull"
-
+        ain = _label(a_in or "0:a")
+        aout_name = a_out.strip("[]")
         if params.audio_noise:
             duration = max(0.25, output_duration(media, params))
             color = "pink" if params.noise_color == "pink" else "white"
             seed = max(1, int(params.noise_seed) & 0x7FFFFFFF)
-            parts.append(f"[0:a]{audio_chain}[a1]")
+            parts.append(f"{ain}{audio_chain}[a1]")
             parts.append(
                 "anoisesrc="
                 f"color={color}:amplitude=0.003162:sample_rate=48000:"
                 f"duration={duration:.4f}:seed={seed},"
                 "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[ano]"
             )
-            parts.append("[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,volume=1[aout]")
+            parts.append(
+                f"[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,volume=1[{aout_name}]"
+            )
         else:
-            parts.append(f"[0:a]{audio_chain}[aout]")
-
+            parts.append(f"{ain}{audio_chain}[{aout_name}]")
     return ";".join(parts)
+
+
+def build_filter_complex(
+    media: MediaInfo,
+    params: UniqueParams,
+    overlay_input: int | None = None,
+) -> str:
+    """Build the uniquization filtergraph.
+
+    ``overlay_input`` is ignored: overlay is generated inside the graph so it
+    varies every frame instead of repeating one PNG.
+    """
+    del overlay_input
+    a_in = "0:a" if media.has_audio else None
+    return uniquize_labeled(media, params, v_in="0:v", a_in=a_in)

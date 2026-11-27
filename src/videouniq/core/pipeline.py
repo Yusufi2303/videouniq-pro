@@ -16,6 +16,11 @@ from videouniq.core.params import UniqueParams
 from videouniq.core.probe import MediaInfo
 from videouniq.paths import cache_dir, ffmpeg_bin
 
+try:
+    from videouniq.editor.filtergraph import GraphSpec
+except Exception:  # pragma: no cover - editor always ships with core
+    GraphSpec = None  # type: ignore[misc,assignment]
+
 ProgressCb = Callable[[float, str], None]
 LogCb = Callable[[str], None]
 
@@ -139,14 +144,32 @@ def encode_copy(
     progress_cb: ProgressCb | None = None,
     log_cb: LogCb | None = None,
     x264_threads: int = 0,
+    graph_spec: object | None = None,
 ) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    graph = build_filter_complex(media, params)
+    spec: GraphSpec | None = graph_spec if isinstance(graph_spec, GraphSpec) else None
+    if spec is not None:
+        graph = spec.graph
+        input_args: list[str] = []
+        for src in spec.inputs:
+            input_args += ["-i", src]
+        has_audio = spec.has_audio
+        color_media = spec.as_media(media.path)
+        expected = max(0.2, spec.duration)
+        if params.tempo > 0:
+            expected = expected / params.tempo + max(0.0, params.aac_priming_ms) / 1000.0
+    else:
+        graph = build_filter_complex(media, params)
+        input_args = ["-i", media.path]
+        has_audio = media.has_audio
+        color_media = media
+        expected = max(0.2, output_duration(media, params))
+
     maps = ["-map", "[vout]"]
     audio_args: list[str] = []
-    if media.has_audio:
+    if has_audio:
         maps += ["-map", "[aout]"]
         audio_args = ["-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2"]
     else:
@@ -161,8 +184,7 @@ def encode_copy(
         "-hide_banner",
         "-y",
         "-nostdin",
-        "-i",
-        media.path,
+        *input_args,
         "-filter_complex",
         graph,
         *maps,
@@ -173,7 +195,7 @@ def encode_copy(
         *thread_args,
         "-pix_fmt",
         "yuv420p",
-        *_color_args(media),
+        *_color_args(color_media),
         *audio_args,
         *ffmpeg_metadata_args(params),
         "-movflags",
@@ -185,9 +207,8 @@ def encode_copy(
     ]
 
     if log_cb:
-        log_cb(f"FFmpeg {encoder.label} → {dest.name}")
-
-    expected = max(0.2, output_duration(media, params))
+        kind = "проект+уникализация" if spec is not None else encoder.label
+        log_cb(f"FFmpeg {kind} → {dest.name}")
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,

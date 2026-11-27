@@ -20,14 +20,20 @@ from PySide6.QtWidgets import (
 
 from videouniq import __app_name__, __version__
 from videouniq.core.hardware import detect_hardware, encoder_with_quality
-from videouniq.core.params import ManualRanges, ModuleFlags, flags_for_preset, ranges_for_preset
-from videouniq.core.pipeline import extract_preview, preview_cache_path
+from videouniq.core.params import ManualRanges, ModuleFlags, UniqueParams, flags_for_preset, ranges_for_preset
+from videouniq.core.pipeline import encode_copy, extract_preview, preview_cache_path
 from videouniq.core.probe import collect_videos, probe_media
 from videouniq.core.randomizer import generate_unique_set, output_folder_name
+from videouniq.editor.export import clear_app_cache, zip_copies
+from videouniq.editor.filtergraph import build_edit_and_uniquize
+from videouniq.editor.history import append_history
+from videouniq.editor.project import EditorProject
 from videouniq.paths import presets_path, settings_ini_path
 from videouniq.queue.models import FileItem, FileStatus
 from videouniq.queue.worker import RenderController
+from videouniq.ui.editor.page import EditorPage
 from videouniq.ui.file_card import open_path
+from videouniq.ui.pages.history_page import HistoryPage
 from videouniq.ui.pages.logs_page import LogsPage
 from videouniq.ui.pages.metadata_page import MetadataPage
 from videouniq.ui.pages.render_settings import RenderSettingsPage
@@ -86,6 +92,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.sidebar)
 
         self.stack = QStackedWidget()
+        self.editor = EditorPage()
         uniq_page = QWidget()
         uniq_split = QSplitter(Qt.Orientation.Horizontal)
         uniq_layout = QHBoxLayout(uniq_page)
@@ -100,11 +107,14 @@ class MainWindow(QMainWindow):
         uniq_split.setSizes([560, 320])
         uniq_layout.addWidget(uniq_split)
 
+        self.history_page = HistoryPage()
         self.render_page = RenderSettingsPage()
         self.meta_page = MetadataPage()
         self.logs_page = LogsPage()
 
+        self.stack.addWidget(self.editor)
         self.stack.addWidget(uniq_page)
+        self.stack.addWidget(self.history_page)
         self.stack.addWidget(self.render_page)
         self.stack.addWidget(self.meta_page)
         self.stack.addWidget(self.logs_page)
@@ -116,13 +126,24 @@ class MainWindow(QMainWindow):
         self.logs_page.append(f"{__app_name__} v{__version__} запущен")
 
         file_menu = self.menuBar().addMenu("Файл")
-        act_open = QAction("Открыть видео…", self)
+        act_open = QAction("Открыть…", self)
         act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(self._browse_files)
+        act_open.triggered.connect(self._open_shortcut)
         file_menu.addAction(act_open)
+        act_project = QAction("Открыть проект…", self)
+        act_project.triggered.connect(self.editor.open_project_dialog)
+        file_menu.addAction(act_project)
+        act_videos = QAction("Открыть видео…", self)
+        act_videos.setShortcut("Ctrl+Shift+O")
+        act_videos.triggered.connect(self._browse_files)
+        file_menu.addAction(act_videos)
         act_folder = QAction("Открыть папку…", self)
         act_folder.triggered.connect(self._browse_folder)
         file_menu.addAction(act_folder)
+        act_save = QAction("Сохранить проект", self)
+        act_save.setShortcut("Ctrl+S")
+        act_save.triggered.connect(lambda: self.editor.save_project(False))
+        file_menu.addAction(act_save)
 
     def _wire(self) -> None:
         self.sidebar.page_changed.connect(self._on_page)
@@ -130,10 +151,17 @@ class MainWindow(QMainWindow):
         self.queue.browse_requested.connect(self._browse_files)
         self.queue.remove_requested.connect(self.remove_item)
         self.queue.open_requested.connect(self._open_item_folder)
+        self.queue.return_requested.connect(self._return_to_editor)
         self.right.start_requested.connect(self.start_render)
         self.right.stop_requested.connect(self.controller.stop)
         self.right.save_preset_requested.connect(self._save_custom_preset)
+        self.right.zip_requested.connect(self._zip_outputs)
         self.render_page.theme_changed.connect(self._set_dark)
+        self.render_page.cache_clear_requested.connect(self._clear_cache)
+        self.editor.send_to_uniquizer.connect(self._from_editor)
+        self.editor.export_clean.connect(self._export_clean)
+        self.editor.zip_requested.connect(self._zip_outputs)
+        self.editor.log_line.connect(self.logs_page.append)
         self.controller.job_progress.connect(self._on_job_progress)
         self.controller.job_finished.connect(self._on_job_finished)
         self.controller.job_failed.connect(self._on_job_failed)
@@ -143,7 +171,25 @@ class MainWindow(QMainWindow):
         self.controller.running_changed.connect(self.right.set_running)
 
     def _on_page(self, key: str) -> None:
-        self.stack.setCurrentIndex({"uniquize": 0, "render": 1, "meta": 2, "logs": 3}.get(key, 0))
+        idx = {
+            "editor": 0,
+            "uniquize": 1,
+            "history": 2,
+            "render": 3,
+            "meta": 4,
+            "logs": 5,
+        }.get(key, 0)
+        self.stack.setCurrentIndex(idx)
+        if key == "history":
+            self.history_page.reload()
+        if key == "editor":
+            self.editor.setFocus()
+
+    def _open_shortcut(self) -> None:
+        if self.sidebar._page == "editor":
+            self.editor.open_project_dialog()
+        else:
+            self._browse_files()
 
     def _detect_hw(self) -> None:
         choice = detect_hardware(self.render_page.encoder_key())
@@ -301,6 +347,7 @@ class MainWindow(QMainWindow):
             root,
             encoder,
             parallel=self.render_page.thread_count(),
+            save_master=self.right.save_master(),
         )
         if n == 0:
             QMessageBox.warning(self, __app_name__, "Не удалось поставить задачи в очередь.")
@@ -357,6 +404,15 @@ class MainWindow(QMainWindow):
             self.logs_page.append("Рендер остановлен")
         else:
             self.logs_page.append("Все задачи завершены")
+            for item in self.items:
+                if item.status == FileStatus.DONE and item.output_dir:
+                    append_history(
+                        "uniquize",
+                        Path(item.path).name,
+                        item.output_dir,
+                        copies=item.copies_done,
+                    )
+            self.history_page.reload()
         self._refresh_queue()
 
     def _save_custom_preset(self) -> None:
@@ -380,6 +436,105 @@ class MainWindow(QMainWindow):
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         self.logs_page.append(f"Пресет сохранён: {payload['name']}")
         QMessageBox.information(self, __app_name__, f"Сохранено: {payload['name']}")
+
+    def _from_editor(self, project: EditorProject) -> None:
+        if not project.path:
+            QMessageBox.warning(self, __app_name__, "Сначала сохраните проект (.vup).")
+            return
+        spec = build_edit_and_uniquize(project, None)
+        media = spec.as_media(project.path)
+        existing = next((it for it in self.items if it.kind == "project" and it.project_path == project.path), None)
+        if existing:
+            existing.project_dict = project.to_dict()
+            existing.info = media
+            existing.status = FileStatus.PENDING
+            existing.error = ""
+            item = existing
+        else:
+            item = FileItem(
+                path=project.path,
+                kind="project",
+                project_path=project.path,
+                project_dict=project.to_dict(),
+                info=media,
+            )
+            first = next((c.source_path for c in project.video_clips if c.source_path), "")
+            if first:
+                preview = preview_cache_path(first)
+                if not preview.is_file():
+                    try:
+                        extract_preview(first, preview)
+                    except Exception:
+                        pass
+                item.preview_path = str(preview)
+            self.items.append(item)
+        self._refresh_queue()
+        self.right.copies_spin.setValue(5)
+        self.sidebar.set_page("uniquize")
+        self.logs_page.append(f"Проект в уникализаторе: {Path(project.path).name}")
+        append_history("project", Path(project.path).name, project.path, extra={"badge": "проект"})
+
+    def _return_to_editor(self, item_id: str) -> None:
+        item = self._find(item_id)
+        if item is None or not item.project_dict:
+            return
+        project = EditorProject.from_dict(item.project_dict)
+        project.path = item.project_path or item.path
+        self.editor.load_project(project)
+        self.sidebar.set_page("editor")
+
+    def _export_clean(self, project: EditorProject) -> None:
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Экспорт чистого видео", str(Path.home() / f"{project.name}.mp4"), "MP4 (*.mp4)"
+        )
+        if not dest:
+            return
+        if not project.video_clips:
+            QMessageBox.information(self, __app_name__, "На таймлайне нет видео.")
+            return
+        spec = build_edit_and_uniquize(project, None)
+        media = spec.as_media(dest)
+        detected = detect_hardware(self.render_page.encoder_key())
+        encoder = encoder_with_quality(
+            detected,
+            crf=self.render_page.crf.value(),
+            nvenc_cq=self.render_page.cq.value(),
+            cpu_preset=str(self.render_page.cpu_preset.currentData()),
+            nvenc_preset=str(self.render_page.nv_preset.currentData()),
+        )
+        params = UniqueParams(write_metadata=False, pad_bytes=16)
+        try:
+            encode_copy(media, params, dest, encoder, graph_spec=spec, x264_threads=2)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, __app_name__, str(exc))
+            self.logs_page.append(f"Экспорт не удался: {exc}")
+            return
+        self.logs_page.append(f"Чистый экспорт: {dest}")
+        append_history("export", Path(dest).name, dest)
+        self.history_page.reload()
+        QMessageBox.information(self, __app_name__, f"Сохранено:\n{dest}")
+
+    def _zip_outputs(self) -> None:
+        folders = [it.output_dir for it in self.items if it.output_dir and Path(it.output_dir).is_dir()]
+        folder = folders[-1] if folders else ""
+        if not folder:
+            folder = QFileDialog.getExistingDirectory(self, "Папка с готовыми копиями")
+        if not folder:
+            return
+        try:
+            dest = zip_copies(folder)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, __app_name__, str(exc))
+            return
+        append_history("zip", Path(dest).name, str(dest))
+        self.history_page.reload()
+        self.logs_page.append(f"ZIP: {dest}")
+        QMessageBox.information(self, __app_name__, f"Архив:\n{dest}")
+
+    def _clear_cache(self) -> None:
+        removed = clear_app_cache()
+        self.logs_page.append(f"Кэш очищен ({len(removed)} объектов)")
+        QMessageBox.information(self, __app_name__, "Кэш превью и временных файлов очищен.")
 
     def grab_to(self, path: str | Path) -> None:
         pix = self.grab()

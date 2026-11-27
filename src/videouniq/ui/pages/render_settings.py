@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -17,6 +18,7 @@ from videouniq.ui.widgets.toggle import ToggleSwitch
 class RenderSettingsPage(QWidget):
     changed = Signal()
     theme_changed = Signal(bool)
+    cache_clear_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -98,6 +100,20 @@ class RenderSettingsPage(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet("color: #9CA3AF; font-size: 12px;")
         layout.addWidget(note)
+
+        layout.addWidget(self._cap("Кэш"))
+        cache_row = QHBoxLayout()
+        self.cache_btn = QPushButton("Очистить кэш превью и временных файлов")
+        self.cache_btn.setObjectName("GhostButton")
+        self.cache_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cache_btn.clicked.connect(self.cache_clear_requested.emit)
+        cache_row.addWidget(self.cache_btn)
+        cache_row.addStretch(1)
+        layout.addLayout(cache_row)
+        cache_hint = QLabel("Удаляет кадры превью и кэш FFmpeg. Проекты .vup не трогает.")
+        cache_hint.setWordWrap(True)
+        cache_hint.setStyleSheet("color: #9CA3AF; font-size: 12px;")
+        layout.addWidget(cache_hint)
         layout.addStretch(1)
 
     def _cap(self, text: str) -> QLabel:

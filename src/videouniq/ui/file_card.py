@@ -34,6 +34,7 @@ def open_path(path: str) -> None:
 class FileCard(QFrame):
     remove_requested = Signal(str)
     open_requested = Signal(str)
+    return_requested = Signal(str)
 
     def __init__(self, item: FileItem, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -55,8 +56,17 @@ class FileCard(QFrame):
 
         mid = QVBoxLayout()
         mid.setSpacing(4)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         self.name = QLabel()
         self.name.setStyleSheet("font-weight: 600;")
+        self.badge = QLabel("Проект")
+        self.badge.setObjectName("ProjectBadge")
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.badge.hide()
+        title_row.addWidget(self.name, 1)
+        title_row.addWidget(self.badge)
         self.meta = QLabel()
         self.meta.setProperty("muted", True)
         self.meta.setStyleSheet("color: #9CA3AF; font-size: 12px;")
@@ -67,7 +77,7 @@ class FileCard(QFrame):
         self.bar.setTextVisible(False)
         self.bar.setRange(0, 1000)
         self.bar.setValue(0)
-        mid.addWidget(self.name)
+        mid.addLayout(title_row)
         mid.addWidget(self.meta)
         mid.addWidget(self.bar)
         mid.addWidget(self.status)
@@ -79,11 +89,17 @@ class FileCard(QFrame):
         self.open_btn.setObjectName("GhostButton")
         self.open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_btn.clicked.connect(lambda: self.open_requested.emit(self.item_id))
+        self.return_btn = QPushButton("В редактор")
+        self.return_btn.setObjectName("GhostButton")
+        self.return_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.return_btn.clicked.connect(lambda: self.return_requested.emit(self.item_id))
+        self.return_btn.hide()
         self.del_btn = QPushButton("Удалить")
         self.del_btn.setObjectName("GhostButton")
         self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.del_btn.clicked.connect(lambda: self.remove_requested.emit(self.item_id))
         actions.addWidget(self.open_btn)
+        actions.addWidget(self.return_btn)
         actions.addWidget(self.del_btn)
         actions.addStretch(1)
         root.addLayout(actions)
@@ -92,7 +108,10 @@ class FileCard(QFrame):
 
     def bind(self, item: FileItem) -> None:
         info = item.info
-        self.name.setText(info.name if info else Path(item.path).name)
+        is_project = item.kind == "project"
+        self.badge.setVisible(is_project)
+        self.return_btn.setVisible(is_project)
+        self.name.setText(info.name if info and not is_project else Path(item.path).name)
         if info:
             self.meta.setText(
                 f"{info.resolution_label}  ·  {info.fps_label}  ·  {info.duration_label}  ·  {info.size_label}"

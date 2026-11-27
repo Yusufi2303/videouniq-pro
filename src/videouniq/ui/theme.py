@@ -76,6 +76,59 @@ QFrame#FileCard {{
 QFrame#FileCard:hover {{
   border-color: {c["accent"]};
 }}
+QLabel#ProjectBadge {{
+  background: {c["accent"]};
+  color: #FFFFFF;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+}}
+QFrame#EditorZone {{
+  background: {c["surface"]};
+  border: 1px solid {c["border"]};
+  border-radius: 10px;
+}}
+QFrame#Timeline {{
+  background: {c["surface"]};
+  border: 1px solid {c["border"]};
+}}
+QWidget#CanvasHost {{
+  background: #0B0D10;
+}}
+QSlider#VolumeSlider::groove:horizontal {{
+  height: 4px;
+}}
+QSplitter::handle {{
+  background: {c["border"]};
+}}
+QListWidget {{
+  background: {c["surface2"]};
+  border: 1px solid {c["border"]};
+  border-radius: 8px;
+  color: {c["text"]};
+  outline: none;
+}}
+QListWidget::item:selected {{
+  background: {c["accent"]};
+  color: #FFFFFF;
+}}
+QTabWidget::pane {{
+  border: 1px solid {c["border"]};
+  border-radius: 8px;
+  background: {c["surface"]};
+}}
+QTabBar::tab {{
+  background: {c["surface2"]};
+  color: {c["muted"]};
+  padding: 6px 12px;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}}
+QTabBar::tab:selected {{
+  background: {c["surface"]};
+  color: {c["text"]};
+}}
 QFrame#DropZone {{
   background: {c["surface"]};
   border: 1.5px dashed {c["border"]};
