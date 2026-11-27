@@ -12,7 +12,6 @@ from pathlib import Path
 from videouniq.core.filters import build_filter_complex, output_duration
 from videouniq.core.hardware import EncoderChoice
 from videouniq.core.metadata import ffmpeg_metadata_args
-from videouniq.core.overlay import write_noise_overlay
 from videouniq.core.params import UniqueParams
 from videouniq.core.probe import MediaInfo
 from videouniq.paths import cache_dir, ffmpeg_bin
@@ -96,6 +95,27 @@ def _seconds_from_ts(value: str) -> float:
         return 0.0
 
 
+def container_output_args(params: UniqueParams, encoder_kind: str) -> list[str]:
+    """Per-copy GOP, keyframe offset, timescale, and mux priming — hash-visible, eye-invisible."""
+    args: list[str] = []
+    gop = int(params.gop_size or 0)
+    if gop > 0:
+        args += ["-g", str(gop), "-keyint_min", str(max(8, gop // 2))]
+        if encoder_kind == "cpu":
+            args += ["-sc_threshold", str(int(params.scenecut or 40))]
+    if params.keyframe_offset > 0:
+        args += ["-force_key_frames", f"{params.keyframe_offset:.3f}"]
+    if params.timescale > 0:
+        args += ["-video_track_timescale", str(int(params.timescale))]
+    args += [
+        "-muxpreload",
+        f"{float(params.mux_preload):.3f}",
+        "-muxdelay",
+        f"{float(params.mux_delay):.3f}",
+    ]
+    return args
+
+
 def _color_args(media: MediaInfo) -> list[str]:
     rng = "tv" if media.color_range in {"tv", "limited", "mpeg"} else media.color_range
     return [
@@ -122,18 +142,8 @@ def encode_copy(
 ) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    overlay_path: Path | None = None
-    overlay_index = None
-    if params.overlay:
-        overlay_path = cache_dir() / "overlays" / f"{dest.stem}_{secrets.token_hex(4)}.png"
-        write_noise_overlay(overlay_path, 160, 160, seed=hash(params.fingerprint()) & 0xFFFFFFFF)
 
-    inputs = ["-i", media.path]
-    if overlay_path is not None:
-        inputs += ["-i", str(overlay_path)]
-        overlay_index = 1
-
-    graph = build_filter_complex(media, params, overlay_index)
+    graph = build_filter_complex(media, params)
     maps = ["-map", "[vout]"]
     audio_args: list[str] = []
     if media.has_audio:
@@ -151,13 +161,15 @@ def encode_copy(
         "-hide_banner",
         "-y",
         "-nostdin",
-        *inputs,
+        "-i",
+        media.path,
         "-filter_complex",
         graph,
         *maps,
         "-c:v",
         encoder.video_codec,
         *encoder.extra,
+        *container_output_args(params, encoder.kind),
         *thread_args,
         "-pix_fmt",
         "yuv420p",
@@ -228,8 +240,6 @@ def encode_copy(
         raise
     finally:
         err_thread.join(timeout=2)
-        if overlay_path is not None:
-            overlay_path.unlink(missing_ok=True)
 
     if code != 0 or not dest.is_file() or dest.stat().st_size < 64:
         err = "".join(err_chunks[-12:]).strip() or f"ffmpeg exit {code}"
