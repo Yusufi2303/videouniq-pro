@@ -49,12 +49,12 @@ class VideoClip:
     has_audio: bool = True
 
     def duration(self) -> float:
-        return max(0.04, float(self.out_point) - float(self.in_point))
+        return max(0.12, float(self.out_point) - float(self.in_point))
 
     def clamped(self) -> VideoClip:
-        src = self.source_duration if self.source_duration > 0 else max(self.out_point, 0.04)
-        self.in_point = max(0.0, min(float(self.in_point), max(0.0, src - 0.04)))
-        self.out_point = max(self.in_point + 0.04, min(float(self.out_point), src if src > 0 else self.out_point))
+        src = self.source_duration if self.source_duration > 0 else max(self.out_point, 0.12)
+        self.in_point = max(0.0, min(float(self.in_point), max(0.0, src - 0.12)))
+        self.out_point = max(self.in_point + 0.12, min(float(self.out_point), src if src > 0 else self.out_point))
         self.volume = max(0.0, min(2.0, float(self.volume)))
         if self.transition not in TRANSITIONS:
             self.transition = "none"

@@ -56,7 +56,7 @@ def split_clip(project: EditorProject, t: float) -> VideoClip | None:
     if hit is None:
         return None
     i, clip, local = hit
-    if local <= clip.in_point + 0.04 or local >= clip.out_point - 0.04:
+    if local <= clip.in_point + 0.12 or local >= clip.out_point - 0.12:
         return None
     right = VideoClip.from_dict(clip.to_dict())
     right.clip_id = _id()

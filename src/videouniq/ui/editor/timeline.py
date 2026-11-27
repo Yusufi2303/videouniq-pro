@@ -125,7 +125,8 @@ class TimelineWidget(QWidget):
             x0 = self._x(starts[i])
             x1 = x0 + clip.duration() * self.px
             if x0 <= x <= x1:
-                edge = "in" if x - x0 < 8 else "out" if x1 - x < 8 else "body"
+                wide = (x1 - x0) >= 24
+                edge = "in" if wide and x - x0 < 8 else "out" if wide and x1 - x < 8 else "body"
                 return clip, edge
         return None
 

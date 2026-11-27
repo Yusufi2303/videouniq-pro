@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -46,6 +46,23 @@ def player_backend() -> str:
         return "qt"
     except Exception:
         return "ffmpeg"
+
+
+class GrabBridge(QObject):
+    done = Signal(object, str, float, int, int)
+
+
+class GrabTask(QRunnable):
+    def __init__(self, src: str, seconds: float, size: tuple[int, int], bridge: GrabBridge) -> None:
+        super().__init__()
+        self.src = src
+        self.seconds = seconds
+        self.size = size
+        self.bridge = bridge
+
+    def run(self) -> None:
+        pix = grab_frame(self.src, self.seconds, self.size)
+        self.bridge.done.emit(pix, self.src, self.seconds, self.size[0], self.size[1])
 
 
 def grab_frame(src: str, seconds: float, size: tuple[int, int]) -> QPixmap | None:
@@ -99,6 +116,7 @@ class CanvasWidget(QWidget):
         self._start_norm = (0.5, 0.5)
         self._start_scale = 1.0
         self._start_rot = 0.0
+        self._press = QPointF()
 
     def set_project(self, project: EditorProject) -> None:
         self.project = project
@@ -193,17 +211,22 @@ class CanvasWidget(QWidget):
             p.drawRect(corner)
         p.restore()
 
-    def _hit(self, pos) -> TextClip | None:
+    def clip_center(self, clip: TextClip) -> QPointF:
         rect = self.canvas_rect()
-        if not rect.contains(pos):
+        return QPointF(rect.left() + clip.x_norm * rect.width(), rect.top() + clip.y_norm * rect.height())
+
+    def _hit(self, pos) -> TextClip | None:
+        pt = QPointF(pos)
+        rect = self.canvas_rect()
+        if not rect.contains(pt):
             return None
-        nx = (pos.x() - rect.left()) / max(1, rect.width())
-        ny = (pos.y() - rect.top()) / max(1, rect.height())
         best = None
-        best_d = 0.08
+        best_d = 1e9
         for clip in reversed(self.visible_texts()):
-            d = abs(clip.x_norm - nx) + abs(clip.y_norm - ny)
-            if d < best_d:
+            c = self.clip_center(clip)
+            d = abs(c.x() - pt.x()) + abs(c.y() - pt.y())
+            # Generous hit box so a real mouse can grab the overlay.
+            if d < max(48.0, 0.12 * min(rect.width(), rect.height())) and d < best_d:
                 best, best_d = clip, d
         return best
 
@@ -216,17 +239,17 @@ class CanvasWidget(QWidget):
             return
         self.selected_id = clip.clip_id
         self.selection_changed.emit(clip.clip_id)
-        self._last = event.position()
+        self._last = QPointF(event.position())
+        self._press = QPointF(event.position())
         self._start_norm = (clip.x_norm, clip.y_norm)
         self._start_scale = clip.scale
         self._start_rot = clip.rotation
-        rect = self.canvas_rect()
-        cx = rect.left() + clip.x_norm * rect.width()
-        cy = rect.top() + clip.y_norm * rect.height()
-        # rotate handle roughly above center
-        if abs(event.position().y() - (cy - 36)) < 14 and abs(event.position().x() - cx) < 14:
+        c = self.clip_center(clip)
+        dx = event.position().x() - c.x()
+        dy = event.position().y() - c.y()
+        if dy < -20 and abs(dx) < 22:
             self._drag = "rotate"
-        elif event.position().x() > cx + 20 and event.position().y() > cy + 8:
+        elif dx > 10 and dy > 2:
             self._drag = "scale"
         else:
             self._drag = "move"
@@ -234,20 +257,23 @@ class CanvasWidget(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
         clip = self._clip_by_id(self.selected_id)
         if not clip or not self._drag:
             return
         rect = self.canvas_rect()
-        delta = event.position() - self._last
+        pos = QPointF(event.position())
         if self._drag == "move":
-            clip.x_norm = max(0.0, min(1.0, clip.x_norm + delta.x() / max(1, rect.width())))
-            clip.y_norm = max(0.0, min(1.0, clip.y_norm + delta.y() / max(1, rect.height())))
+            delta = pos - self._last
+            clip.x_norm = max(0.0, min(1.0, clip.x_norm + delta.x() / max(1.0, rect.width())))
+            clip.y_norm = max(0.0, min(1.0, clip.y_norm + delta.y() / max(1.0, rect.height())))
             self._guides = True
         elif self._drag == "scale":
-            clip.scale = max(0.2, min(4.0, self._start_scale + delta.x() / 120.0))
+            clip.scale = max(0.2, min(4.0, self._start_scale + (pos.x() - self._press.x()) / 120.0))
         elif self._drag == "rotate":
-            clip.rotation = max(-180.0, min(180.0, self._start_rot + delta.x() * 0.4))
-        self._last = event.position()
+            clip.rotation = max(-180.0, min(180.0, self._start_rot + (pos.x() - self._press.x()) * 0.4))
+        self._last = pos
         self.text_changed.emit()
         self.update()
 
@@ -327,10 +353,13 @@ class PreviewPlayer(QWidget):
         layout.addLayout(controls)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(33)
+        self._timer.setInterval(80)
         self._timer.timeout.connect(self._tick)
         self._last_grab_t = -1.0
         self._last_grab_src = ""
+        self._grabbing = False
+        self._grab_bridge = GrabBridge(self)
+        self._grab_bridge.done.connect(self._on_grab)
         self._init_backend()
 
     def _backend_label(self) -> str:
@@ -444,13 +473,16 @@ class PreviewPlayer(QWidget):
             self.canvas.set_frame(None)
             return
         _, clip, local = hit
-        if self.playing and clip.source_path == self._last_grab_src and abs(local - self._last_grab_t) < 0.12:
+        if clip.source_path == self._last_grab_src and abs(local - self._last_grab_t) < 0.08:
             self.canvas.update()
             return
-        pix = grab_frame(clip.source_path, local, size)
+        if self._grabbing:
+            self.canvas.update()
+            return
+        self._grabbing = True
         self._last_grab_t = local
         self._last_grab_src = clip.source_path
-        self.canvas.set_frame(pix)
+        QThreadPool.globalInstance().start(GrabTask(clip.source_path, local, size, self._grab_bridge))
         if self._qt_player is not None and clip.source_path != self._src:
             self._src = clip.source_path
             self._qt_player.setSource(QUrl.fromLocalFile(clip.source_path))
@@ -459,6 +491,11 @@ class PreviewPlayer(QWidget):
                 self._mpv.command("seek", local, "absolute")
             except Exception:
                 pass
+
+    def _on_grab(self, pix, src: str, seconds: float, _w: int, _h: int) -> None:
+        self._grabbing = False
+        if src == self._last_grab_src:
+            self.canvas.set_frame(pix if pix is not None else QPixmap())
 
 
 def _fmt(seconds: float) -> str:
