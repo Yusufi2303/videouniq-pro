@@ -2,7 +2,7 @@
 
 Пакетная уникализация видео без нейросетей и визуальный редактор (CapCut-стиль). Windows 10/11 x64 (портативная папка с `.exe`) и Linux для разработки.
 
-Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (libmpv по возможности, иначе Qt Multimedia / кадры FFmpeg). Версия: **2.1.1**.
+Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (libmpv по возможности, иначе Qt Multimedia / кадры FFmpeg). Версия: **2.1.2**.
 
 ## Запуск на Linux (демо / разработка)
 

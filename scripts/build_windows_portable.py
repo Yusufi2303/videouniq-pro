@@ -60,13 +60,16 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "requirements.txt", dest / "requirements.txt")
     shutil.copy2(ROOT / "README.md", dest / "README.md")
     shutil.copy2(ROOT / "scripts" / "VideoUniqPro.bat", dest / "VideoUniqPro.bat")
+    shutil.copy2(ROOT / "scripts" / "windows_boot.py", dest / "boot.py")
     exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro 2.1.1 — портативная сборка для Windows 10/11 x64.\r\n"
+        "VideoUniq Pro 2.1.2 — портативная сборка для Windows 10/11 x64.\r\n"
         "1. Распакуйте ВСЮ папку на рабочий стол (python, src, vendor рядом с .exe).\r\n"
         "2. Запустите VideoUniqPro.exe из этой папки (без чёрной консоли).\r\n"
         "   Не копируйте только .exe — Python ищется рядом с ним, не из другой папки.\r\n"
         "   Запасной запуск: VideoUniqPro.bat\r\n"
+        "Если окно не открылось — смотрите VideoUniqPro-launch.log рядом с exe\r\n"
+        "или %LOCALAPPDATA%\\VideoUniqPro\\launch.log\r\n"
         "FFmpeg и Python уже внутри. Интернет не нужен.\r\n",
         encoding="utf-8",
     )
@@ -138,26 +141,83 @@ def verify_zip(dest_zip: Path) -> None:
         "VideoUniqPro/VideoUniqPro.exe",
         "VideoUniqPro/python/pythonw.exe",
         "VideoUniqPro/python/python.exe",
+        "VideoUniqPro/python/python312._pth",
+        "VideoUniqPro/boot.py",
         "VideoUniqPro/VideoUniqPro.bat",
         "VideoUniqPro/src/videouniq/__init__.py",
+        "VideoUniqPro/python/Lib/site-packages/sitecustomize.py",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
     }
     with zipfile.ZipFile(dest_zip) as zf:
         names = set(zf.namelist())
+        pth = zf.read("VideoUniqPro/python/python312._pth").decode("utf-8", "replace")
     missing = sorted(r for r in required if r not in names)
     if missing:
         raise RuntimeError("zip missing " + ", ".join(missing))
+    if "../src" not in pth.replace("\\", "/"):
+        raise RuntimeError("python312._pth must include ../src (embed ignores PYTHONPATH)")
     print("zip verified", dest_zip)
 
 
 def patch_pth(python_dir: Path) -> None:
+    """Embeddable python*._pth ignores PYTHONPATH; src must be listed here."""
     pth = next(python_dir.glob("python*._pth"))
     text = pth.read_text(encoding="utf-8")
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    extras = ["Lib/site-packages", "import site"]
+    extras = ["Lib/site-packages", "../src", "import site"]
     for extra in extras:
         if extra not in lines:
             lines.append(extra)
+    # Keep "import site" last so sitecustomize can run.
+    if "import site" in lines:
+        lines = [ln for ln in lines if ln != "import site"] + ["import site"]
     pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("patched", pth.name, "->", " | ".join(lines))
+
+
+def write_sitecustomize(python_dir: Path) -> None:
+    dest = python_dir / "Lib" / "site-packages" / "sitecustomize.py"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "scripts" / "windows_sitecustomize.py", dest)
+
+
+def copy_vc_redist(python_dir: Path) -> None:
+    """Put MSVC CRT next to python.exe so Qt/shiboken resolve without System32."""
+    src = python_dir / "Lib" / "site-packages" / "PySide6"
+    for name in (
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_codecvt_ids.dll",
+        "concrt140.dll",
+    ):
+        item = src / name
+        if item.is_file():
+            shutil.copy2(item, python_dir / name)
+
+
+def ensure_icu(python_dir: Path) -> None:
+    dest = python_dir / "Lib" / "site-packages" / "PySide6" / "resources" / "icudtl.dat"
+    if dest.is_file() and dest.stat().st_size > 1000:
+        return
+    wheel_dir = ROOT / "build" / "cache" / "wheels-win"
+    wheels = sorted(wheel_dir.glob("pyside6*.whl")) if wheel_dir.is_dir() else []
+    if not wheels:
+        return
+    name = "PySide6/resources/icudtl.dat"
+    with zipfile.ZipFile(wheels[0]) as zf:
+        if name not in zf.namelist():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(zf.read(name))
+        print("restored", dest, dest.stat().st_size)
+
+
+def finalize_python_runtime(python_dir: Path) -> None:
+    patch_pth(python_dir)
+    write_sitecustomize(python_dir)
+    copy_vc_redist(python_dir)
+    ensure_icu(python_dir)
 
 
 def install_wheels(python_dir: Path, wheel_dir: Path) -> None:
@@ -250,7 +310,6 @@ def slim_pyside(pyside: Path) -> None:
         "uic.exe",
         "QtOpenGL.pyd",
         "QtOpenGL.pyi",
-        "resources/icudtl.dat",
         "plugins/sqldrivers/*",
         "translations/*.qm",
         "qml/**",
@@ -309,6 +368,7 @@ def main() -> int:
     if update_only:
         print("update existing bundle", bundle)
         ensure_pythonw(bundle / "python")
+        finalize_python_runtime(bundle / "python")
         copy_app(bundle)
     else:
         if WORK.exists():
@@ -327,11 +387,11 @@ def main() -> int:
         python_dir = bundle / "python"
         unzip(py_zip, python_dir)
         ensure_pythonw(python_dir)
-        patch_pth(python_dir)
         install_wheels(python_dir, cache / "wheels-win")
         place_ffmpeg(bundle, ff_zip)
-        copy_app(bundle)
         slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        finalize_python_runtime(python_dir)
+        copy_app(bundle)
 
     dest = DIST / ZIP_NAME
     zip_bundle(bundle, dest)
