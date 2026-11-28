@@ -19,12 +19,17 @@ from PySide6.QtWidgets import (
 )
 
 from videouniq import __app_name__, __version__
-from videouniq.core.hardware import detect_hardware, encoder_with_quality
+from videouniq.core.hardware import detect_hardware, ram_gb, recommended_encode_workers, encoder_with_quality
 from videouniq.core.params import ManualRanges, ModuleFlags, UniqueParams, flags_for_preset, ranges_for_preset
 from videouniq.core.pipeline import encode_copy, extract_preview, preview_cache_path
 from videouniq.core.probe import collect_videos, probe_media
 from videouniq.core.randomizer import generate_unique_set, output_folder_name
-from videouniq.editor.export import clear_app_cache, zip_copies
+from videouniq.editor.export import (
+    cleanup_on_quit,
+    clear_app_cache,
+    purge_cache_older_than,
+    zip_copies,
+)
 from videouniq.editor.filtergraph import build_edit_and_uniquize
 from videouniq.editor.history import append_history
 from videouniq.editor.project import EditorProject
@@ -123,6 +128,10 @@ class MainWindow(QMainWindow):
         self._wire()
         self._restore()
         self._detect_hw()
+        stale = purge_cache_older_than(24.0, keep_autosave=True)
+        if stale:
+            self.logs_page.append(f"Кэш: удалено устаревших файлов: {len(stale)}")
+        self.render_page.refresh_cache_size()
         self.logs_page.append(f"{__app_name__} v{__version__} запущен")
 
         file_menu = self.menuBar().addMenu("Файл")
@@ -184,6 +193,8 @@ class MainWindow(QMainWindow):
             self.history_page.reload()
         if key == "editor":
             self.editor.setFocus()
+        if key == "render":
+            self.render_page.refresh_cache_size()
 
     def _open_shortcut(self) -> None:
         if self.sidebar._page == "editor":
@@ -198,10 +209,24 @@ class MainWindow(QMainWindow):
         self.sidebar.set_hardware(f"GPU: {gpu}\n{choice.label}")
         self.render_page.set_hardware_info(text)
         self.logs_page.append(f"Аппаратный энкодер: {choice.label}")
+        self.logs_page.append(
+            f"RAM {ram_gb():.0f} ГБ · потоков уникализации: {self.render_page.thread_count()} "
+            f"(рекомендуется {recommended_encode_workers()})"
+        )
 
     def _restore(self) -> None:
-        threads = int(self.settings.value("threads", 2))
-        idx = 0 if threads != 4 else 1
+        rec = recommended_encode_workers()
+        raw = self.settings.value("threads", rec)
+        try:
+            threads = int(raw)
+        except (TypeError, ValueError):
+            threads = rec
+        # Old default was 2; on 8 GB-class that OOMs Hard 1080×1920.
+        if threads == 2 and rec == 1:
+            threads = 1
+        if threads not in (1, 2, 4):
+            threads = rec
+        idx = {1: 0, 2: 1, 4: 2}.get(threads, 0)
         self.render_page.threads.setCurrentIndex(idx)
         enc = str(self.settings.value("encoder", "auto"))
         for i in range(self.render_page.encoder.count()):
@@ -532,7 +557,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, __app_name__, f"Архив:\n{dest}")
 
     def _clear_cache(self) -> None:
-        removed = clear_app_cache()
+        removed = clear_app_cache(also_autosave=False)
+        self.render_page.refresh_cache_size()
         self.logs_page.append(f"Кэш очищен ({len(removed)} объектов)")
         QMessageBox.information(self, __app_name__, "Кэш превью и временных файлов очищен.")
 
@@ -544,5 +570,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self.controller.running:
             self.controller.stop()
+        keep = bool(getattr(self.editor, "dirty", False))
+        if keep:
+            try:
+                self.editor._autosave()
+            except Exception:
+                pass
+        cleanup_on_quit(keep_autosave=keep)
         self.settings.sync()
         super().closeEvent(event)

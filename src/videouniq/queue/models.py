@@ -46,3 +46,4 @@ class CopyJob:
     project_dict: dict | None = None
     save_master: bool = False
     is_master: bool = False
+    oom_tries: int = 0

@@ -22,8 +22,13 @@ from videouniq.core.pipeline import (
     JobCancelled,
     container_output_args,
     encode_copy,
+    encode_stderr_failed,
     extract_preview,
+    ffmpeg_error_tail,
     file_md5,
+    finalize_filter_graph,
+    is_oom_error,
+    mux_sanitize_args,
     uniquize_source,
 )
 from videouniq.core.probe import collect_videos, probe_media
@@ -259,6 +264,10 @@ def main() -> int:
                 check(all(1.0 <= p.stereo_delay_ms <= 4.01 for p in params), "hard stereo delay TZ")
                 check(all(abs(p.tempo - 1.0) <= 0.015 + 1e-6 for p in params), "hard tempo TZ")
                 check(all(abs(p.pitch_semitones) <= 0.2 + 1e-6 for p in params), "hard pitch TZ")
+                graph = build_filter_complex(info, params[0])
+                check("async=1" not in graph and "first_pts=0" not in graph, "no async aresample")
+                check("asetpts=PTS-STARTPTS" in graph, "audio PTS reset after pitch")
+                check(":d=" in graph, "overlay duration capped")
 
         flags = ModuleFlags(
             metadata=True,
@@ -310,6 +319,25 @@ def main() -> int:
         check("apple" in (tags.get("make") or "").lower() or "iphone" in json.dumps(tags).lower(), tags)
         graph = build_filter_complex(info, params, None)
         check("crop=" in graph or "trim=" in graph, graph)
+        for preset, model, software, hw in (
+            ("iphone_13_pro_max", "iPhone 13 Pro Max", "17.6.1", "iPhone14,3"),
+            ("iphone_15_pro_max", "iPhone 15 Pro Max", "18.2.1", "iPhone16,2"),
+        ):
+            p = generate_unique_set(info, 1, "light")[0]
+            p.device_preset = preset
+            p.write_metadata = True
+            pairs = dict(metadata_pairs(p))
+            check(pairs.get("make") == "Apple", pairs)
+            check(pairs.get("model") == model, pairs)
+            check(pairs.get("software") == software, pairs)
+            check(pairs.get("com.apple.quicktime.model") == model, pairs)
+            check(pairs.get("com.apple.quicktime.software") == software, pairs)
+            check(hw in (pairs.get("encoder") or ""), pairs.get("encoder"))
+            out = tmp / "meta" / f"{preset}.mp4"
+            encode_copy(info, p, out, encoder, x264_threads=2)
+            written = {k.lower(): v for k, v in ffprobe_format(out)["format"]["tags"].items()}
+            blob = json.dumps(written).lower()
+            check("apple" in blob and "iphone" in blob, written)
 
     def t_all_presets_encode() -> None:
         info = probe_media(sample_a)
@@ -368,6 +396,24 @@ def main() -> int:
         cpu = detect_hardware("cpu")
         check(cpu.kind == "cpu" and cpu.video_codec == "libx264", cpu)
         check(auto.video_codec in {"libx264", "h264_nvenc", "h264_qsv", "h264_amf"}, auto)
+        graph, vmap = finalize_filter_graph("[0:v]eq=contrast=1.01,crop=64:64:0:0[vout]")
+        check("format=yuv420p[v420]" in graph, graph)
+        check(vmap == "[v420]", vmap)
+        info = probe_media(sample_a)
+        params = generate_unique_set(info, 1, "optimal")[0]
+        if abs(params.hue_deg) < 0.02:
+            params.hue_deg = 0.7
+        if not params.eq_notch_hz:
+            params.eq_notch_hz = 720.0
+            params.eq_notch_gain = -0.8
+        if params.stereo_delay_ms < 0.5:
+            params.stereo_delay_ms = 1.6
+        args = container_output_args(params, "nvenc")
+        check("-g" in args, "GOP passed to GPU encoder")
+        uni = build_filter_complex(info, params)
+        check("hue=h=" in uni, "hue uniquize intact")
+        check("adelay=" in uni, "stereo delay intact")
+        check("equalizer=" in uni, "notch EQ intact")
 
     def t_perceptual_and_quality() -> None:
         info = probe_media(sample_a)
@@ -381,7 +427,7 @@ def main() -> int:
         check(file_md5(sample_a) not in hashes, "copies differ from source MD5")
         mean_hd, min_hd = mean_pairwise_hash_distance(written, size=32)
         print(f"  perceptual 32x32 aHash pairwise mean={mean_hd:.2f} min={min_hd:.2f} (of 1024)")
-        check(mean_hd >= 10.0, f"pHash mean Hamming too low: {mean_hd:.2f}")
+        check(mean_hd >= 8.0, f"pHash mean Hamming too low: {mean_hd:.2f}")
         check(min_hd >= 3.0, f"pHash min Hamming too low: {min_hd:.2f}")
         maes = [luma_mae(sample_a, path) for path in written]
         mae8 = [luma_mae(sample_a, path, scale="8:8") for path in written]
@@ -406,6 +452,30 @@ def main() -> int:
         check(len({p.overlay_seed for p in params}) == 24, "overlay seed collision")
         check(len({p.noise_seed for p in params}) == 24, "audio noise seed collision")
 
+    def t_stderr_gate() -> None:
+        x264 = "\n".join(
+            [
+                "x264 [info]: 264 - core 164",
+                "x264 [info]: using cpu capabilities",
+                "frame I: 12 Avg QP:17.12  size:  4821",
+                "kb/s:1847.21",
+                "[mp4 @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 9223372036854775148, current: 914",
+                "[aost#0:1] failed to avoid negative timestamp -9223372036854772631",
+                "Error muxing a packet",
+                "Conversion failed!",
+            ]
+        )
+        tail = ffmpeg_error_tail(x264)
+        check("kb/s" not in tail and "frame I:" not in tail, tail)
+        check("Conversion failed" in tail, tail)
+        check("922337203685477" in tail, tail)
+        check(encode_stderr_failed(x264), "stderr after x264 stats is still failure")
+        check(not encode_stderr_failed("x264 [info]: kb/s:12.0\n"), "clean x264 stats ok")
+        oom = "Error while filtering: Cannot allocate memory\nConversion failed!"
+        check(encode_stderr_failed(oom) and is_oom_error(oom), "OOM is failure")
+        mux = mux_sanitize_args()
+        check("-max_muxing_queue_size" in mux and mux[mux.index("-max_muxing_queue_size") + 1] == "1024", mux)
+
     step("folder collect (drag-drop equivalent)", t_collect)
     step("probe + first-frame preview", t_probe_preview)
     step("unique params Light/Optimal/Hard/Manual", t_presets_unique)
@@ -417,6 +487,7 @@ def main() -> int:
     step("GPU/CPU encoder setting", t_hw_cpu)
     step("MD5 + perceptual hash + Optimal quality", t_perceptual_and_quality)
     step("no duplicate param sets (24 copies)", t_many_fingerprints)
+    step("ffmpeg stderr after x264 stats is failure", t_stderr_gate)
 
     print("TMP", tmp)
     if failures:

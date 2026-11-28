@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -17,13 +18,25 @@ from videouniq.core.params import UniqueParams
 from videouniq.core.pipeline import encode_copy, file_md5
 from videouniq.core.probe import probe_media
 from videouniq.core.randomizer import generate_unique_set
-from videouniq.editor.export import autosave_path, clear_app_cache, zip_copies
+from videouniq.core.pipeline import finalize_filter_graph
+from videouniq.editor.export import (
+    autosave_path,
+    cache_size_label,
+    clear_app_cache,
+    cleanup_on_quit,
+    purge_cache_older_than,
+    zip_copies,
+)
 from videouniq.editor.filtergraph import build_edit_and_uniquize, is_one_pass_graph
+from videouniq.editor.proxy import is_heavy_source
+from videouniq.editor.text_paint import clamp_text_shift, render_text_png
+from videouniq.paths import cache_dir
 from videouniq.editor.history import append_history, clear_history, load_history
 from videouniq.editor.ops import (
     clip_at_time,
     close_gaps,
     delete_clip,
+    join_clip_with_next,
     packed_starts,
     reorder_clip,
     split_clip,
@@ -186,6 +199,21 @@ def t_trim_split_magnetic() -> None:
     c2 = VideoClip(in_point=0, out_point=1, source_duration=1)
     p2 = EditorProject(video_clips=[c1, c2])
     check(abs(packed_starts(p2.video_clips)[1] - 1.0) < 1e-6, "abut")
+    src = VideoClip(source_path="/tmp/long.mp4", in_point=0, out_point=8.0, source_duration=8.0)
+    ps = EditorProject(video_clips=[src])
+    right = split_clip(ps, 3.0)
+    check(right is not None and len(ps.video_clips) == 2, "split two pieces")
+    check(ps.video_clips[0].clip_id != ps.video_clips[1].clip_id, "split unique ids")
+    left_id, right_id = ps.video_clips[0].clip_id, ps.video_clips[1].clip_id
+    check(reorder_clip(ps, right_id, 0), "reorder split")
+    check(ps.video_clips[0].clip_id == right_id, "split piece dragged to front")
+    check(delete_clip(ps, right_id), "delete one split piece")
+    check(len(ps.video_clips) == 1 and ps.video_clips[0].clip_id == left_id, "other piece remains")
+    extra = VideoClip(source_path="/tmp/b.mp4", in_point=0, out_point=2.0, source_duration=2.0)
+    ps.video_clips.append(extra)
+    check(len(ps.video_clips) == 2, "append imported clip")
+    check(join_clip_with_next(ps, ps.video_clips[0].clip_id), "glue appended")
+    check(ps.video_clips[0].transition == "none", "glue concat")
     p2.video_clips[0].transition = "crossfade"
     p2.video_clips[0].transition_duration = 0.4
     starts = packed_starts(p2.video_clips)
@@ -207,15 +235,15 @@ def t_filtergraph_one_pass(tmp: Path) -> None:
     g = spec.graph
     check("trim=" in g, "edit trim")
     check("xfade=" in g or "concat=" in g, "edit join")
-    check("drawtext=" in g, "text overlay")
-    check("box=1" in g, "tiktok plate")
-    check("borderw=" in g, "stroke")
+    check("enable='between" in g or "drawtext=" in g, "text overlay")
+    check("overlay=0:0" in g or "box=1" in g, "tiktok plate via png overlay")
+    check("format=yuv420p" in g, "yuv420p in graph")
     check("volume=" in g, "per-clip volume")
     check(is_one_pass_graph(g), "edit+uniquize same graph")
     check("noise=" in g or "eq=" in g or "hue=h=" in g, "uniquize in graph")
     check(g.count("-filter_complex") == 0, "graph is the complex, not two commands")
     clean = build_edit_and_uniquize(proj, None)
-    check("drawtext=" in clean.graph, "clean still has text")
+    check("enable='between" in clean.graph or "drawtext=" in clean.graph, "clean still has text")
     check(not is_one_pass_graph(clean.graph) or "noise=" not in clean.graph, "clean has no uniquize grain")
     # one ffmpeg process encodes edit+uniquize
     encoder = detect_hardware("cpu")
@@ -256,6 +284,53 @@ def t_zip_history_cache(tmp: Path) -> None:
     check(isinstance(removed, list), removed)
     auto = autosave_path()
     check(auto.parent.is_dir(), auto)
+    check(str(cache_dir()).rstrip("/\\").endswith("cache"), f"cache dir {cache_dir()}")
+    check("Размер кэша" in cache_size_label(), cache_size_label())
+    junk = cache_dir() / "tmp" / "old.bin"
+    junk.parent.mkdir(parents=True, exist_ok=True)
+    junk.write_bytes(b"x" * 64)
+    os.utime(junk, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+    purged = purge_cache_older_than(24.0, keep_autosave=True)
+    check(any("old.bin" in x for x in purged) or not junk.is_file(), "24h purge")
+    auto = autosave_path()
+    auto.write_text("{}", encoding="utf-8")
+    cleanup_on_quit(keep_autosave=True)
+    check(auto.is_file(), "quit keeps autosave")
+
+
+def t_text_png_and_safe_zone(tmp: Path) -> None:
+    print("text PNG overlay / safe zone / yuv420p")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication(["videouniq-test"])
+    a = make_sample(tmp / "txt.mp4", 1.2)
+    proj = sample_project(a)
+    clip = proj.text_clips[0]
+    clip.plate = True
+    clip.shadow = True
+    clip.stroke_enabled = True
+    clip.y_norm = 0.02
+    png = render_text_png(clip, 1920, 1080, 0, 0)
+    check(png.is_file() and png.stat().st_size > 100, png)
+    jx, jy = clamp_text_shift(clip, 1920, 1080, 0, -15)
+    check(jy >= -15, (jx, jy))
+    # near the top edge the -15 jitter must not leave the 5% safe zone
+    from videouniq.editor.text_paint import SAFE_PCT, measure_text
+
+    x0, y0, x1, y1 = measure_text(clip, 1920, 1080, jx, jy).aabb
+    check(y0 >= 1080 * SAFE_PCT - 1.0, f"safe y0={y0} jy={jy}")
+    spec = build_edit_and_uniquize(proj, None)
+    check("enable='between" in spec.graph, spec.graph[:200])
+    g2, vmap = finalize_filter_graph(spec.graph)
+    check("[v420]" in g2 and vmap == "[v420]", vmap)
+    check("format=yuv420p[v420]" in g2, "forced yuv420p before encode")
+    check(is_heavy_source(3840, 2160) and not is_heavy_source(1920, 1080), "4K is heavy")
+    check(not is_heavy_source(1080, 1920), "9:16 1080p is not heavy")
+    edge = TextClip(text="Низ", x_norm=0.5, y_norm=0.97, font_size=40, plate=True)
+    jx2, jy2 = clamp_text_shift(edge, 1080, 1920, 12, 15)
+    x0, y0, x1, y1 = measure_text(edge, 1080, 1920, jx2, jy2).aabb
+    check(y1 <= 1920 - 1920 * SAFE_PCT + 1.0, f"bottom safe y1={y1} jy={jy2}")
 
 
 def t_ui_surfaces() -> None:
@@ -285,6 +360,25 @@ def t_ui_surfaces() -> None:
     check(win.editor.player is not None, "player")
     check(win.editor.inspector is not None, "inspector")
     check(win.editor.timeline is not None, "timeline")
+    player = win.editor.player
+    check(player.backend == "qt", f"backend={player.backend}")
+    check(player._qt_player is not None and player._audio is not None, "QMediaPlayer+QAudioOutput")
+    check(abs(float(player._audio.volume()) - 0.85) < 0.02, player._audio.volume())
+    check(not player._audio.isMuted(), "audio unmuted")
+    check(player._sink is not None, "QVideoSink native frames")
+    check("звук" in player.backend_lab.text(), player.backend_lab.text())
+    dummy = VideoClip(source_path="01.mp4", in_point=0, out_point=8.0, source_duration=8.0, source_width=1080, source_height=1920)
+    win.editor.project.video_clips = [dummy]
+    win.editor.player.set_project(win.editor.project)
+    player.play()
+    app.processEvents()
+    check(player.playing, "play() starts")
+    check(not player._timer.isActive(), "qt play does not grab stills")
+    check(player._play_watch.isActive(), "play watchdog")
+    player.pause()
+    check(not player.playing, "pause() stops")
+    check(not is_heavy_source(1080, 1920), "1080x1920 plays native")
+    check(1 in [win.render_page.threads.itemData(i) for i in range(win.render_page.threads.count())], "1 worker option")
     check(win.editor.inspector.shift_box.text().startswith("Слегка"), win.editor.inspector.shift_box.text())
     check("Плашка" in win.editor.bin.tiktok_btn.text() or "TikTok" in win.editor.bin.tiktok_btn.text(), win.editor.bin.tiktok_btn.text())
     win.sidebar.set_page("uniquize")
@@ -293,6 +387,8 @@ def t_ui_surfaces() -> None:
     check(win.right.master_toggle is not None, "save master")
     check(win.render_page.cache_btn is not None, "cache clear")
     check("Очистить кэш" in win.render_page.cache_btn.text(), win.render_page.cache_btn.text())
+    check("Размер кэша" in win.render_page.cache_size_lab.text(), win.render_page.cache_size_lab.text())
+    check("сейчас" in win.render_page.cache_btn.text(), "clear now label")
     # project badge path
     proj = EditorProject(name="ui")
     win._from_editor.__func__  # exists
@@ -307,6 +403,34 @@ def t_ui_surfaces() -> None:
     app.processEvents()
     check(win.sidebar._page == "editor", win.sidebar._page)
     check(win.editor._auto.interval() == 60_000, "autosave 60s")
+    check(win.editor.delete_btn.text() == "Удалить", "delete button")
+    check(win.editor.join_btn.text() == "Склеить", "join button")
+    long_clip = VideoClip(source_path="01.mp4", in_point=0, out_point=158.0, source_duration=158.0)
+    win.editor.project.video_clips = [long_clip]
+    win.editor.timeline.set_project(win.editor.project)
+    win.editor.timeline.resize(900, 180)
+    check(win.editor.timeline.max_scroll() > 100, f"scroll range {win.editor.timeline.max_scroll()}")
+    win.editor.timeline.set_playhead(150.0)
+    phx = win.editor.timeline._x(150.0)
+    check(0 < phx < win.editor.timeline.width() + 40, f"playhead on screen {phx}")
+    from videouniq.core.metadata import DEVICE_LABELS, metadata_pairs
+    from videouniq.core.params import DEVICE_PRESETS, UniqueParams
+
+    check("iphone_13_pro_max" in DEVICE_PRESETS and "iphone_15_pro_max" in DEVICE_PRESETS, DEVICE_PRESETS)
+    labels = [DEVICE_LABELS[k] for k in DEVICE_PRESETS if k.startswith("iphone")]
+    check(labels[:6] == ["iPhone 13", "iPhone 13 Pro Max", "iPhone 14", "iPhone 15", "iPhone 15 Pro Max", "iPhone 16"], labels[:6])
+    p13 = UniqueParams(device_preset="iphone_13_pro_max", metadata_token="abc123")
+    tags13 = dict(metadata_pairs(p13))
+    check(tags13.get("make") == "Apple", tags13)
+    check(tags13.get("model") == "iPhone 13 Pro Max", tags13)
+    check(tags13.get("software") == "17.6.1", tags13)
+    check(tags13.get("com.apple.quicktime.software") == "17.6.1", tags13)
+    check("iPhone14,3" in (tags13.get("encoder") or ""), tags13.get("encoder"))
+    p15 = UniqueParams(device_preset="iphone_15_pro_max", metadata_token="abc123")
+    tags15 = dict(metadata_pairs(p15))
+    check(tags15.get("model") == "iPhone 15 Pro Max", tags15)
+    check(tags15.get("software") == "18.2.1", tags15)
+    check("iPhone16,2" in (tags15.get("encoder") or ""), tags15.get("encoder"))
     win.sidebar.set_page("history")
     app.processEvents()
     check(win.stack.currentIndex() == 2, "history page index")
@@ -322,6 +446,7 @@ def main() -> int:
         t_trim_split_magnetic()
         t_filtergraph_one_pass(tmp)
         t_zip_history_cache(tmp)
+        t_text_png_and_safe_zone(tmp)
         t_ui_surfaces()
     print(f"\nPASSED={PASSED} FAILED={FAILED}")
     if FAILED:

@@ -7,8 +7,10 @@ PresetName = Literal["light", "optimal", "hard", "manual"]
 
 DEVICE_PRESETS = (
     "iphone_13",
+    "iphone_13_pro_max",
     "iphone_14",
     "iphone_15",
+    "iphone_15_pro_max",
     "iphone_16",
     "samsung_s23",
     "samsung_s24",
@@ -209,7 +211,7 @@ class UniqueParams:
 @dataclass
 class RenderSettings:
     encoder: str = "auto"  # auto | cpu | nvenc | qsv | amf
-    threads: int = 2
+    threads: int = 1
     crf: int = 17
     nvenc_cq: int = 19
     nvenc_preset: str = "p6"

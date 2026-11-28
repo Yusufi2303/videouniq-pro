@@ -5,11 +5,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
-    QFont,
-    QFontDatabase,
     QImage,
     QMouseEvent,
     QPainter,
@@ -23,12 +21,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
-from videouniq.editor.ops import clip_at_time, timeline_duration
+from videouniq.editor.ops import clip_at_time, packed_starts, timeline_duration
 from videouniq.editor.project import ASPECTS, EditorProject, TextClip
+from videouniq.editor.proxy import ensure_proxy, ensure_stream_copy, is_heavy_source
+from videouniq.editor.text_paint import render_text_image, text_fingerprint
 from videouniq.paths import ffmpeg_bin
 
 
@@ -65,36 +66,56 @@ class GrabTask(QRunnable):
         self.bridge.done.emit(pix, self.src, self.seconds, self.size[0], self.size[1])
 
 
-def grab_frame(src: str, seconds: float, size: tuple[int, int]) -> QPixmap | None:
+def grab_frame(
+    src: str,
+    seconds: float,
+    size: tuple[int, int],
+    hwaccel: bool = False,
+) -> QPixmap | None:
     if not src or not Path(src).is_file():
         return None
     w, h = size
-    cmd = [
-        ffmpeg_bin(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-ss",
-        f"{max(0.0, seconds):.4f}",
-        "-i",
-        src,
-        "-frames:v",
-        "1",
-        "-vf",
-        f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "mjpeg",
-        "pipe:1",
-    ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=8, check=False)
-    if proc.returncode != 0 or not proc.stdout:
-        return None
-    img = QImage.fromData(proc.stdout, "JPG")
-    if img.isNull():
-        return None
-    return QPixmap.fromImage(img)
+
+    def _once(use_hw: bool, codec: str, seek_after: bool) -> QPixmap | None:
+        cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error"]
+        cmd += ["-fflags", "+genpts+igndts+discardcorrupt", "-ignore_editlist", "1"]
+        if use_hw:
+            cmd += ["-hwaccel", "auto"]
+        ts = f"{max(0.0, seconds):.4f}"
+        if not seek_after:
+            cmd += ["-ss", ts]
+        cmd += ["-i", src]
+        if seek_after:
+            cmd += ["-ss", ts]
+        fmt = "png" if codec == "png" else "mjpeg"
+        cmd += [
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            codec,
+            "pipe:1",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=12, check=False)
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        img = QImage.fromData(proc.stdout, "PNG" if fmt == "png" else "JPG")
+        if img.isNull():
+            return None
+        return QPixmap.fromImage(img)
+
+    for use_hw, codec, seek_after in (
+        (False, "png", True),
+        (False, "mjpeg", True),
+        (hwaccel, "mjpeg", False),
+    ):
+        pix = _once(use_hw, codec, seek_after)
+        if pix is not None:
+            return pix
+    return None
 
 
 class CanvasWidget(QWidget):
@@ -106,9 +127,12 @@ class CanvasWidget(QWidget):
         self.setObjectName("CanvasHost")
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.frame = QPixmap()
+        self.live_video = False
         self.selected_id = ""
         self._drag = ""
         self._last = QPointF()
@@ -117,6 +141,8 @@ class CanvasWidget(QWidget):
         self._start_scale = 1.0
         self._start_rot = 0.0
         self._press = QPointF()
+        self.loading = False
+        self._img_cache: dict[str, tuple[str, QImage]] = {}
 
     def set_project(self, project: EditorProject) -> None:
         self.project = project
@@ -150,11 +176,15 @@ class CanvasWidget(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#0B0D10"))
         rect = self.canvas_rect()
-        p.fillRect(rect, QColor("#111318"))
-        if not self.frame.isNull():
-            p.drawPixmap(rect.toRect(), self.frame)
+        if self.live_video:
+            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        else:
+            p.fillRect(self.rect(), QColor("#0B0D10"))
+            p.fillRect(rect, QColor("#111318"))
+            if not self.frame.isNull():
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                p.drawPixmap(rect.toRect(), self.frame)
         if self._guides:
             pen = QPen(QColor("#3B82F6"))
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -162,53 +192,51 @@ class CanvasWidget(QWidget):
             p.drawLine(rect.center().x(), rect.top(), rect.center().x(), rect.bottom())
             p.drawLine(rect.left(), rect.center().y(), rect.right(), rect.center().y())
         for clip in self.visible_texts():
-            self._paint_text(p, rect, clip, clip.clip_id == self.selected_id)
+            img = self._text_image(clip)
+            if img is not None and not img.isNull():
+                p.drawImage(rect, img)
+            if clip.clip_id == self.selected_id:
+                self._paint_handles(p, rect, clip)
+        if self.loading:
+            badge = QRectF(rect.right() - 168, rect.top() + 10, 156, 28)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(17, 19, 24, 200))
+            p.drawRoundedRect(badge, 8, 8)
+            p.setPen(QColor("#E5E7EB"))
+            p.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), "Загрузка кадра…")
         p.end()
 
-    def _paint_text(self, p: QPainter, rect: QRectF, clip: TextClip, selected: bool) -> None:
-        font = QFont(clip.font_family)
-        if clip.font_file and Path(clip.font_file).is_file():
-            fid = QFontDatabase.addApplicationFont(clip.font_file)
-            fams = QFontDatabase.applicationFontFamilies(fid)
-            if fams:
-                font = QFont(fams[0])
-        font.setPixelSize(max(8, int(clip.font_size * clip.scale * (rect.height() / max(1, self.project.canvas_height if self.project else 1080)))))
+    def _text_image(self, clip: TextClip) -> QImage | None:
+        if self.project is None:
+            return None
+        w, h = self.project.canvas_width, self.project.canvas_height
+        key = text_fingerprint(clip, 0, 0, w, h)
+        hit = self._img_cache.get(clip.clip_id)
+        if hit and hit[0] == key:
+            return hit[1]
+        try:
+            img = render_text_image(clip, w, h, 0, 0)
+        except Exception:
+            return None
+        self._img_cache[clip.clip_id] = (key, img)
+        return img
+
+    def _paint_handles(self, p: QPainter, rect: QRectF, clip: TextClip) -> None:
         p.save()
         cx = rect.left() + clip.x_norm * rect.width()
         cy = rect.top() + clip.y_norm * rect.height()
         p.translate(cx, cy)
         p.rotate(clip.rotation)
-        p.setFont(font)
-        metrics = p.fontMetrics()
-        box = metrics.boundingRect(clip.text)
-        box.adjust(-14, -8, 14, 8)
-        box.moveCenter(QPoint(0, 0))
-        if clip.plate:
-            col = QColor(clip.plate_color)
-            col.setAlphaF(clip.plate_opacity)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(col)
-            p.drawRoundedRect(box, 8, 8)
-        if clip.shadow:
-            p.setPen(QColor(clip.shadow_color))
-            p.drawText(clip.shadow_x, metrics.ascent() // 2 + clip.shadow_y, clip.text)
-        if clip.stroke_enabled and clip.stroke_width > 0:
-            pen = QPen(QColor(clip.stroke_color))
-            pen.setWidth(max(1, int(clip.stroke_width)))
-            p.setPen(pen)
-            p.drawText(-metrics.horizontalAdvance(clip.text) // 2, metrics.ascent() // 2, clip.text)
-        p.setPen(QColor(clip.color))
-        tw = metrics.horizontalAdvance(clip.text)
-        p.drawText(-tw // 2, metrics.ascent() // 2, clip.text)
-        if selected:
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(QColor("#3B82F6"), 1, Qt.PenStyle.DashLine))
-            p.drawRect(box)
-            handle = QRectF(-5, box.top() - 18, 10, 10)
-            p.setBrush(QColor("#3B82F6"))
-            p.drawEllipse(handle)
-            corner = QRectF(box.right() - 6, box.bottom() - 6, 10, 10)
-            p.drawRect(corner)
+        scale = rect.height() / max(1.0, float(self.project.canvas_height if self.project else 1080))
+        bw = max(48.0, (clip.font_size * clip.scale * 0.6 + 36) * scale)
+        bh = max(28.0, (clip.font_size * clip.scale + 20) * scale)
+        box = QRectF(-bw / 2, -bh / 2, bw, bh)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#3B82F6"), 1, Qt.PenStyle.DashLine))
+        p.drawRect(box)
+        p.setBrush(QColor("#3B82F6"))
+        p.drawEllipse(QRectF(-5, box.top() - 18, 10, 10))
+        p.drawRect(QRectF(box.right() - 6, box.bottom() - 6, 10, 10))
         p.restore()
 
     def clip_center(self, clip: TextClip) -> QPointF:
@@ -274,6 +302,7 @@ class CanvasWidget(QWidget):
         elif self._drag == "rotate":
             clip.rotation = max(-180.0, min(180.0, self._start_rot + (pos.x() - self._press.x()) * 0.4))
         self._last = pos
+        self._img_cache.pop(clip.clip_id, None)
         self.text_changed.emit()
         self.update()
 
@@ -287,6 +316,7 @@ class CanvasWidget(QWidget):
         if clip is None:
             return
         clip.scale = max(0.2, min(4.0, clip.scale + (0.08 if event.angleDelta().y() > 0 else -0.08)))
+        self._img_cache.pop(clip.clip_id, None)
         self.text_changed.emit()
         self.update()
 
@@ -298,13 +328,22 @@ class PreviewPlayer(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.backend = player_backend()
+        self.backend = "ffmpeg"
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.playing = False
         self._qt_player = None
+        self._audio = None
+        self._video = None
         self._mpv = None
+        self._sink = None
         self._src = ""
+        self._ignore_pos = False
+        self._pending_local = 0.0
+        self._need_open_seek = False
+        self._watch_pos = -1
+        self._stuck = 0
+        self._remuxed: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -314,7 +353,7 @@ class PreviewPlayer(QWidget):
         cap.setProperty("heading", True)
         top.addWidget(cap)
         top.addStretch(1)
-        self.backend_lab = QLabel(self._backend_label())
+        self.backend_lab = QLabel("")
         self.backend_lab.setStyleSheet("color: #9CA3AF; font-size: 11px;")
         top.addWidget(self.backend_lab)
         self.aspect = QComboBox()
@@ -325,10 +364,20 @@ class PreviewPlayer(QWidget):
         top.addWidget(self.aspect)
         layout.addLayout(top)
 
+        host = QWidget()
+        host.setObjectName("CanvasHost")
+        stack = QStackedLayout(host)
+        stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        self._video_host = QWidget()
+        self._video_host.setStyleSheet("background: #0B0D10;")
+        vh = QVBoxLayout(self._video_host)
+        vh.setContentsMargins(0, 0, 0, 0)
+        stack.addWidget(self._video_host)
         self.canvas = CanvasWidget()
         self.canvas.selection_changed.connect(self.selection_changed.emit)
         self.canvas.text_changed.connect(self.project_changed.emit)
-        layout.addWidget(self.canvas, 1)
+        stack.addWidget(self.canvas)
+        layout.addWidget(host, 1)
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton("▶")
@@ -360,32 +409,50 @@ class PreviewPlayer(QWidget):
         self._grabbing = False
         self._grab_bridge = GrabBridge(self)
         self._grab_bridge.done.connect(self._on_grab)
+        self._frame_cache: dict[tuple, QPixmap] = {}
+        self._proxy_of: dict[str, str] = {}
+        self._proxy_pending: set[str] = set()
+        self._seeking = False
+        self.seek.sliderPressed.connect(self._seek_start)
+        self.seek.sliderReleased.connect(self._seek_end)
+        self._play_watch = QTimer(self)
+        self._play_watch.setInterval(200)
+        self._play_watch.timeout.connect(self._ensure_playing)
         self._init_backend()
 
     def _backend_label(self) -> str:
-        return {"mpv": "libmpv", "qt": "Qt Multimedia", "ffmpeg": "FFmpeg / Qt"}.get(self.backend, self.backend)
+        if self.backend == "qt":
+            return "Qt Multimedia · звук"
+        return "FFmpeg кадры · без звука"
 
     def _init_backend(self) -> None:
-        if self.backend == "mpv":
-            try:
-                import mpv
+        try:
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 
-                self._mpv = mpv.MPV(vo="null", pause=True, idle=True)
-            except Exception:
-                self.backend = "ffmpeg"
-                self._mpv = None
-        if self.backend == "qt":
+            self._audio = QAudioOutput(self)
+            self._audio.setVolume(0.85)
+            self._audio.setMuted(False)
+            self._sink = QVideoSink(self)
+            self._sink.videoFrameChanged.connect(self._on_video_frame)
+            self._qt_player = QMediaPlayer(self)
+            self._qt_player.setAudioOutput(self._audio)
+            self._qt_player.setVideoOutput(self._sink)
+            self._qt_player.positionChanged.connect(self._on_pos)
+            self._qt_player.mediaStatusChanged.connect(self._on_status)
             try:
-                from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-
-                self._qt_player = QMediaPlayer(self)
-                audio = QAudioOutput(self)
-                audio.setVolume(0.0)
-                self._qt_player.setAudioOutput(audio)
+                self._qt_player.errorOccurred.connect(self._on_qt_error)
             except Exception:
-                self.backend = "qt_fail"
-                self._qt_player = None
-                self.backend = "ffmpeg"
+                pass
+            self._video_host.hide()
+            self.backend = "qt"
+            self.canvas.live_video = False
+        except Exception:
+            self._qt_player = None
+            self._audio = None
+            self._video = None
+            self._sink = None
+            self.backend = "ffmpeg"
+            self.canvas.live_video = False
         self.backend_lab.setText(self._backend_label())
 
     def set_project(self, project: EditorProject) -> None:
@@ -397,6 +464,7 @@ class PreviewPlayer(QWidget):
             self.aspect.setCurrentIndex(idx)
             self.aspect.blockSignals(False)
         self.set_playhead(min(self.playhead, timeline_duration(project)))
+        self._prepare_proxies(project)
 
     def _on_aspect(self) -> None:
         if self.project is None:
@@ -423,14 +491,33 @@ class PreviewPlayer(QWidget):
     def play(self) -> None:
         if self.duration() <= 0:
             return
+        if self.playhead >= self.duration() - 0.05:
+            self.playhead = 0.0
+            self.canvas.playhead = 0.0
         self.playing = True
         self.play_btn.setText("❚❚")
+        if self._audio is not None:
+            self._audio.setMuted(False)
+            self._audio.setVolume(0.85)
+        if self._qt_player is not None:
+            self._sync_source(force_seek=False)
+            try:
+                self._qt_player.setPlaybackRate(1.0)
+            except Exception:
+                pass
+            self._qt_player.play()
+            self._timer.stop()
+            self._stuck = 0
+            self._watch_pos = -1
+            self._play_watch.start()
+            return
         self._timer.start()
 
     def pause(self) -> None:
         self.playing = False
         self.play_btn.setText("▶")
         self._timer.stop()
+        self._play_watch.stop()
         if self._qt_player is not None:
             self._qt_player.pause()
 
@@ -448,7 +535,158 @@ class PreviewPlayer(QWidget):
             self.seek.blockSignals(False)
         self.time_lab.setText(f"{_fmt(self.playhead)} / {_fmt(dur)}")
         self.playhead_changed.emit(self.playhead)
+        if self._qt_player is not None:
+            self._sync_source(force_seek=True)
+            self.canvas.update()
+            return
         self.refresh_frame()
+
+    def _on_video_frame(self, frame) -> None:
+        try:
+            if frame is None or not frame.isValid():
+                return
+            img = frame.toImage()
+        except Exception:
+            return
+        if img.isNull():
+            return
+        self.canvas.set_frame(QPixmap.fromImage(img))
+
+    def _on_qt_error(self, *_args) -> None:
+        if self._qt_player is None:
+            return
+        try:
+            err = str(self._qt_player.errorString() or "")
+        except Exception:
+            err = ""
+        if err:
+            self.backend_lab.setText(f"Qt · {err[:42]}")
+
+    def _ensure_playing(self) -> None:
+        if not self.playing or self._qt_player is None:
+            self._play_watch.stop()
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+
+            state = self._qt_player.playbackState()
+            if state != QMediaPlayer.PlaybackState.PlayingState:
+                self._qt_player.play()
+        except Exception:
+            try:
+                self._qt_player.play()
+            except Exception:
+                return
+        pos = int(self._qt_player.position())
+        if self._watch_pos >= 0 and pos == self._watch_pos:
+            self._stuck += 1
+            if self._stuck == 2:
+                self._qt_player.play()
+            elif self._stuck >= 4:
+                self._try_stream_copy()
+                self._stuck = 0
+        else:
+            self._stuck = 0
+        self._watch_pos = pos
+
+    def _try_stream_copy(self) -> None:
+        if self.project is None or self._qt_player is None:
+            return
+        hit = clip_at_time(self.project, self.playhead)
+        if hit is None:
+            return
+        _, clip, local = hit
+        src = self._play_src(clip)
+        if not src or src in self._remuxed:
+            return
+        remux = ensure_stream_copy(src)
+        self._remuxed.add(src)
+        if remux == src:
+            return
+        self._proxy_of[clip.source_path] = remux
+        self._src = ""
+        self._pending_local = local
+        self._need_open_seek = True
+        self._qt_player.setSource(QUrl.fromLocalFile(remux))
+        self._qt_player.play()
+
+    def _on_status(self, status) -> None:
+        if self._qt_player is None:
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+        except Exception:
+            return
+        ready = {
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        }
+        if status in ready and self._need_open_seek:
+            self._need_open_seek = False
+            want = int(max(0.0, self._pending_local) * 1000)
+            # Seeking to 0 on open stalls some Qt/FFmpeg backends on the first play().
+            if want > 80:
+                self._ignore_pos = True
+                self._qt_player.setPosition(want)
+                self._ignore_pos = False
+            if self.playing:
+                self._qt_player.play()
+
+    def _sync_source(self, force_seek: bool = True) -> None:
+        if self._qt_player is None or self.project is None:
+            return
+        hit = clip_at_time(self.project, self.playhead)
+        if hit is None:
+            return
+        _, clip, local = hit
+        src = self._play_src(clip)
+        if not src or not Path(src).is_file():
+            return
+        self._pending_local = local
+        if src != self._src:
+            self._src = src
+            self._need_open_seek = True
+            self._qt_player.setSource(QUrl.fromLocalFile(src))
+            return
+        if not force_seek:
+            return
+        want = int(max(0.0, local) * 1000)
+        cur = int(self._qt_player.position())
+        if abs(cur - want) > 120:
+            self._ignore_pos = True
+            self._qt_player.setPosition(want)
+            self._ignore_pos = False
+
+    def _on_pos(self, ms: int) -> None:
+        if self._ignore_pos or not self.playing or self.project is None:
+            return
+        hit = clip_at_time(self.project, self.playhead)
+        if hit is None:
+            self.pause()
+            return
+        i, clip, _ = hit
+        starts = packed_starts(self.project.video_clips)
+        local = ms / 1000.0
+        t = starts[i] + max(0.0, local - clip.in_point)
+        if t >= starts[i] + clip.duration() - 0.02:
+            if i + 1 < len(self.project.video_clips):
+                self.playhead = packed_starts(self.project.video_clips)[i + 1]
+                self._sync_source()
+                self._qt_player.play()
+            else:
+                self.pause()
+                return
+        else:
+            self.playhead = min(t, self.duration())
+        self.canvas.playhead = self.playhead
+        dur = self.duration()
+        if dur > 0:
+            self.seek.blockSignals(True)
+            self.seek.setValue(int(self.playhead / dur * 1000))
+            self.seek.blockSignals(False)
+        self.time_lab.setText(f"{_fmt(self.playhead)} / {_fmt(dur)}")
+        self.playhead_changed.emit(self.playhead)
+        self.canvas.update()
 
     def _seek_frac(self, value: int) -> None:
         dur = self.duration()
@@ -462,40 +700,100 @@ class PreviewPlayer(QWidget):
             return
         self.set_playhead(nxt)
 
+    def _prepare_proxies(self, project: EditorProject) -> None:
+        for clip in project.video_clips:
+            if not clip.source_path or not is_heavy_source(clip.source_width, clip.source_height):
+                continue
+            if clip.source_path in self._proxy_of or clip.source_path in self._proxy_pending:
+                continue
+            src = clip.source_path
+            self._proxy_pending.add(src)
+            w, h = clip.source_width, clip.source_height
+
+            class _ProxyTask(QRunnable):
+                def __init__(self, path: str, width: int, height: int, bridge: GrabBridge) -> None:
+                    super().__init__()
+                    self.path, self.width, self.height, self.bridge = path, width, height, bridge
+
+                def run(self) -> None:
+                    try:
+                        proxy = ensure_proxy(self.path, self.width, self.height)
+                    except Exception:
+                        proxy = self.path
+                    self.bridge.done.emit(None, f"proxy:{self.path}|{proxy}", 0.0, 0, 0)
+
+            QThreadPool.globalInstance().start(_ProxyTask(src, w, h, self._grab_bridge))
+
+    def _seek_start(self) -> None:
+        self._seeking = True
+        self._set_loading(True)
+
+    def _seek_end(self) -> None:
+        self._seeking = False
+        self._set_loading(self._grabbing)
+
+    def _set_loading(self, on: bool) -> None:
+        self.canvas.loading = bool(on)
+        self.canvas.update()
+
+    def _play_src(self, clip) -> str:
+        return self._proxy_of.get(clip.source_path) or clip.source_path
+
     def refresh_frame(self) -> None:
         if self.project is None:
             self.canvas.set_frame(None)
+            return
+        if self._qt_player is not None:
+            self._sync_source(force_seek=True)
+            self.canvas.update()
             return
         hit = clip_at_time(self.project, self.playhead)
         rect = self.canvas.canvas_rect()
         size = (max(160, int(rect.width())), max(160, int(rect.height())))
         if hit is None:
             self.canvas.set_frame(None)
+            self._set_loading(False)
             return
         _, clip, local = hit
+        src = self._play_src(clip)
+        cache_key = (src, round(local, 2), size[0], size[1])
+        cached = self._frame_cache.get(cache_key)
+        if cached is not None:
+            self.canvas.set_frame(cached)
+            self._set_loading(False)
+            return
         if clip.source_path == self._last_grab_src and abs(local - self._last_grab_t) < 0.08:
             self.canvas.update()
             return
         if self._grabbing:
+            self._set_loading(True)
             self.canvas.update()
             return
         self._grabbing = True
+        self._set_loading(True)
         self._last_grab_t = local
-        self._last_grab_src = clip.source_path
-        QThreadPool.globalInstance().start(GrabTask(clip.source_path, local, size, self._grab_bridge))
-        if self._qt_player is not None and clip.source_path != self._src:
-            self._src = clip.source_path
-            self._qt_player.setSource(QUrl.fromLocalFile(clip.source_path))
-        if self._mpv is not None and clip.source_path:
-            try:
-                self._mpv.command("seek", local, "absolute")
-            except Exception:
-                pass
+        self._last_grab_src = src
+        QThreadPool.globalInstance().start(GrabTask(src, local, size, self._grab_bridge))
 
     def _on_grab(self, pix, src: str, seconds: float, _w: int, _h: int) -> None:
+        if isinstance(src, str) and src.startswith("proxy:"):
+            raw, proxy = src[6:].split("|", 1)
+            self._proxy_of[raw] = proxy
+            self._proxy_pending.discard(raw)
+            self.refresh_frame()
+            return
         self._grabbing = False
+        if not self._seeking:
+            self._set_loading(False)
         if src == self._last_grab_src:
-            self.canvas.set_frame(pix if pix is not None else QPixmap())
+            frame = pix if pix is not None else QPixmap()
+            self.canvas.set_frame(frame)
+            if pix is not None:
+                key = (src, round(seconds, 2), _w, _h)
+                self._frame_cache[key] = pix
+                if len(self._frame_cache) > 36:
+                    first = next(iter(self._frame_cache))
+                    self._frame_cache.pop(first, None)
 
 
 def _fmt(seconds: float) -> str:

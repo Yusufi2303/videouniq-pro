@@ -54,12 +54,15 @@ def shot(win: MainWindow, name: str) -> Path:
         import shutil
 
         shutil.copy2(dest, STORE_SHOT / name)
+        v21 = name if name.startswith("v2.1-") else f"v2.1-{name}"
+        shutil.copy2(dest, STORE_SHOT / v21)
+        shutil.copy2(dest, SHOT / v21)
     except Exception:
         pass
     return dest
 
 
-def make_sample(path: Path, seconds: float = 0.8) -> Path:
+def make_sample(path: Path, seconds: float = 0.8, size: str = "640x360") -> Path:
     import subprocess
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +75,7 @@ def make_sample(path: Path, seconds: float = 0.8) -> Path:
         "-f",
         "lavfi",
         "-i",
-        f"testsrc2=size=640x360:rate=30:duration={seconds}",
+        f"testsrc2=size={size}:rate=30:duration={seconds}",
         "-f",
         "lavfi",
         "-i",
@@ -244,8 +247,13 @@ def main() -> int:
     shot(win, "live_05_scale_rotate.png")
 
     # Player: space / arrows / aspect
+    check(win.editor.player.backend == "qt", f"player backend={win.editor.player.backend}")
+    check(win.editor.player._audio is not None and not win.editor.player._audio.isMuted(), "audio unmuted")
+    check("звук" in win.editor.player.backend_lab.text(), win.editor.player.backend_lab.text())
     click(win.editor.player.play_btn)
     pump(250)
+    check(win.editor.player.playing, "play starts")
+    check(not win.editor.player._timer.isActive(), "qt play is not ffmpeg stills")
     click(win.editor.player.play_btn)
     click(win.editor.player.next_btn)
     pump(80)
@@ -253,6 +261,11 @@ def main() -> int:
     win.editor.player.aspect.setCurrentIndex(idx)
     pump(80)
     check(win.editor.project.aspect == "16:9", win.editor.project.aspect)
+    win.editor.player._set_loading(True)
+    pump(40)
+    shot(win, "v2.1-playhead-loading.png")
+    win.editor.player._set_loading(False)
+    shot(win, "v2.1-player.png")
 
     # Save .vup by clicking Сохранить (path preset)
     win.editor.project.path = str(vup)
@@ -325,12 +338,61 @@ def main() -> int:
     shot(win, "live_09b_history.png")
     click(win.sidebar._buttons["render"])
     pump(80)
+    check("Размер кэша" in win.render_page.cache_size_lab.text(), win.render_page.cache_size_lab.text())
+    check("Очистить кэш сейчас" in win.render_page.cache_btn.text(), win.render_page.cache_btn.text())
+    shot(win, "v2.1-settings-cache.png")
     click(win.render_page.cache_btn)
     pump(80)
     logs = win.logs_page.view.toPlainText()
     check("Кэш очищен" in logs, "cache clear log")
 
     shot(win, "live_10_settings_cache.png")
+    shot(win, "v2.1-player-proxy-label.png")
+
+    # Native 1080×1920 must actually play (clock + decoded frames), not freeze or proxy.
+    from videouniq.core.probe import probe_media
+    from videouniq.editor.proxy import is_heavy_source
+
+    phone = make_sample(tmp / "phone_1080x1920.mp4", 3.2, size="1080x1920")
+    click(win.sidebar._buttons["editor"])
+    pump(80)
+    pinfo = probe_media(phone)
+    check((pinfo.width, pinfo.height) == (1080, 1920), (pinfo.width, pinfo.height))
+    check(pinfo.has_audio, "phone has audio")
+    check(not is_heavy_source(pinfo.width, pinfo.height), "1080x1920 is not a proxy candidate")
+    win.editor.project.video_clips.clear()
+    win.editor.project.text_clips.clear()
+    win.editor.project.aspect = "9:16"
+    win.editor.project.sync_canvas()
+    win.editor.add_media(str(phone))
+    pump(400)
+    check(len(win.editor.project.video_clips) >= 1, "phone clip on timeline")
+    clip0 = win.editor.project.video_clips[0]
+    check((clip0.source_width, clip0.source_height) == (1080, 1920), (clip0.source_width, clip0.source_height))
+    idx16 = win.editor.player.aspect.findData("9:16")
+    if idx16 >= 0:
+        win.editor.player.aspect.setCurrentIndex(idx16)
+    win.editor.player.set_playhead(0.0)
+    pump(250)
+    t0 = win.editor.player.playhead
+    pos0 = int(win.editor.player._qt_player.position()) if win.editor.player._qt_player else 0
+    click(win.editor.player.play_btn)
+    pump(1600)
+    check(win.editor.player.playing, "native 1080x1920 play starts")
+    check(not win.editor.player._timer.isActive(), "native play is QMediaPlayer not FFmpeg stills")
+    ph = win.editor.player.playhead
+    qt_pos = int(win.editor.player._qt_player.position()) if win.editor.player._qt_player else 0
+    check(ph - t0 >= 0.35 or qt_pos - pos0 >= 300, f"clock moved playhead={ph:.2f} qt={qt_pos}ms")
+    frame = win.editor.player.canvas.frame
+    check(not frame.isNull(), "decoded native frame present")
+    if not frame.isNull():
+        check(
+            frame.width() >= 1000 and frame.height() >= 1700,
+            f"frame is native not widget-proxy {frame.width()}x{frame.height()}",
+        )
+    shot(win, "v2.1.5-player-native-1080x1920.png")
+    click(win.editor.player.play_btn)
+    pump(80)
     win.close()
     pump(50)
 

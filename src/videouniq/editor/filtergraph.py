@@ -12,6 +12,7 @@ from videouniq.core.params import UniqueParams
 from videouniq.core.probe import MediaInfo
 from videouniq.editor.ops import packed_starts, timeline_duration
 from videouniq.editor.project import EditorProject, TextClip, VideoClip
+from videouniq.editor.text_paint import clamp_text_shift, render_text_png
 
 
 @dataclass
@@ -244,16 +245,27 @@ def build_edit_and_uniquize(
     if project.text_clips:
         for ti, tclip in enumerate(project.text_clips):
             nxt = f"vtx{ti}"
-            dt = _drawtext_filter(tclip, w, h, dx, dy)
-            if abs(tclip.rotation) > 0.4:
-                rad = math.radians(tclip.rotation)
-                parts.append(f"[{v_cur}]split[vkeep{ti}][vrot{ti}]")
+            jx, jy = clamp_text_shift(tclip, w, h, dx, dy)
+            png = _text_png_or_none(tclip, w, h, jx, jy)
+            start = max(0.0, tclip.start)
+            end = tclip.end()
+            if png is not None:
+                idx = _input_idx(str(png))
                 parts.append(
-                    f"[vrot{ti}]format=rgba,{dt},rotate={rad:.6f}:ow=iw:oh=ih:c=none:fillcolor=none[vr{ti}]"
+                    f"[{v_cur}][{idx}:v]overlay=0:0:format=auto:"
+                    f"enable='between(t,{start:.4f},{end:.4f})'[{nxt}]"
                 )
-                parts.append(f"[vkeep{ti}][vr{ti}]overlay=0:0:format=auto[{nxt}]")
             else:
-                parts.append(f"[{v_cur}]{dt}[{nxt}]")
+                dt = _drawtext_filter(tclip, w, h, jx, jy)
+                if abs(tclip.rotation) > 0.4:
+                    rad = math.radians(tclip.rotation)
+                    parts.append(f"[{v_cur}]split[vkeep{ti}][vrot{ti}]")
+                    parts.append(
+                        f"[vrot{ti}]format=rgba,{dt},rotate={rad:.6f}:ow=iw:oh=ih:c=none:fillcolor=none[vr{ti}]"
+                    )
+                    parts.append(f"[vkeep{ti}][vr{ti}]overlay=0:0:format=auto[{nxt}]")
+                else:
+                    parts.append(f"[{v_cur}]{dt}[{nxt}]")
             v_cur = nxt
 
     if params is None:
@@ -296,9 +308,20 @@ def build_edit_and_uniquize(
     )
 
 
+def _text_png_or_none(clip: TextClip, width: int, height: int, dx: int, dy: int) -> str | None:
+    try:
+        path = render_text_png(clip, width, height, dx, dy)
+    except Exception:
+        return None
+    return str(path) if path and Path(path).is_file() else None
+
+
 def is_one_pass_graph(graph: str) -> bool:
     """True when the graph contains both an edit op and a uniquize op."""
-    edit = any(tok in graph for tok in ("trim=", "concat=", "xfade=", "drawtext="))
+    edit = any(
+        tok in graph
+        for tok in ("trim=", "concat=", "xfade=", "drawtext=", "enable='between")
+    )
     uni = any(tok in graph for tok in ("noise=", "eq=", "hue=h=", "unsharp=", "anoisesrc="))
     return edit and uni
 

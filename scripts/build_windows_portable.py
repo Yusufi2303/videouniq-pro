@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Assemble a portable Windows x64 folder: embeddable CPython + wheels + FFmpeg + app.
 
-Rebuild after the V2 visual editor add-on so the zip matches src/videouniq.
-The previous shipped artifact is v2.0.0; next zip is v2.0.1.
+Rebuild after V2.1 so the zip matches src/videouniq.
+Ships VideoUniqPro.exe (GUI, no console) plus VideoUniqPro.bat fallback.
 """
 
 from __future__ import annotations
@@ -60,24 +60,169 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "requirements.txt", dest / "requirements.txt")
     shutil.copy2(ROOT / "README.md", dest / "README.md")
     shutil.copy2(ROOT / "scripts" / "VideoUniqPro.bat", dest / "VideoUniqPro.bat")
+    shutil.copy2(ROOT / "scripts" / "windows_boot.py", dest / "boot.py")
+    exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro — портативная сборка для Windows 10/11 x64.\r\n"
-        "1. Распакуйте папку на рабочий стол.\r\n"
-        "2. Запустите VideoUniqPro.bat\r\n"
+        "VideoUniq Pro 2.1.5 — портативная сборка для Windows 10/11 x64.\r\n"
+        "1. Распакуйте ВСЮ папку на рабочий стол (python, src, vendor рядом с .exe).\r\n"
+        "2. Запустите VideoUniqPro.exe из этой папки (без чёрной консоли).\r\n"
+        "   Не копируйте только .exe — Python ищется рядом с ним, не из другой папки.\r\n"
+        "   Запасной запуск: VideoUniqPro.bat\r\n"
+        "Если окно не открылось — смотрите VideoUniqPro-launch.log рядом с exe\r\n"
+        "или %LOCALAPPDATA%\\VideoUniqPro\\launch.log\r\n"
         "FFmpeg и Python уже внутри. Интернет не нужен.\r\n",
         encoding="utf-8",
     )
+    if exe is None:
+        print("WARNING: VideoUniqPro.exe not built (mingw missing)")
+
+
+def compile_windows_exe(bundle: Path) -> Path | None:
+    """Cross-compile a GUI-subsystem PE launcher with icon (no console)."""
+    gcc = shutil.which("x86_64-w64-mingw32-gcc")
+    windres = shutil.which("x86_64-w64-mingw32-windres")
+    if not gcc:
+        return None
+    icon = ROOT / "src" / "videouniq" / "resources" / "app.ico"
+    if not icon.is_file():
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "make_app_icon.py")], check=False)
+    work = ROOT / "build" / "win-launcher"
+    work.mkdir(parents=True, exist_ok=True)
+    obj = work / "launcher.o"
+    res_obj = work / "app.res"
+    src = ROOT / "scripts" / "windows_launcher.c"
+    cmd = [gcc, "-c", "-O2", str(src), "-o", str(obj)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print("launcher cc", proc.stderr or proc.stdout)
+        return None
+    link = [gcc, "-mwindows", "-O2", str(obj)]
+    if windres and icon.is_file():
+        rc = work / "app.rc"
+        rc.write_text(f'IDI_ICON1 ICON "{icon.as_posix()}"\n', encoding="utf-8")
+        rproc = subprocess.run(
+            [windres, "-O", "coff", "-i", str(rc), "-o", str(res_obj)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rproc.returncode == 0:
+            link.append(str(res_obj))
+        else:
+            print("windres", rproc.stderr or rproc.stdout)
+    link += ["-o", str(work / "VideoUniqPro.exe")]
+    proc = subprocess.run(link, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print("launcher link", proc.stderr or proc.stdout)
+        return None
+    dest = bundle / "VideoUniqPro.exe"
+    built = work / "VideoUniqPro.exe"
+    if dest.resolve() != built.resolve():
+        shutil.copy2(built, dest)
+    magic = dest.read_bytes()[:2]
+    print("exe", dest, dest.stat().st_size, "MZ" if magic == b"MZ" else magic)
+    return dest
+
+
+def ensure_pythonw(python_dir: Path) -> None:
+    """Embeddable CPython usually ships pythonw.exe; copy python.exe if not."""
+    pye = python_dir / "python.exe"
+    pyw = python_dir / "pythonw.exe"
+    if not pye.is_file():
+        raise RuntimeError(f"python.exe missing in {python_dir}")
+    if not pyw.is_file():
+        shutil.copy2(pye, pyw)
+        print("copied python.exe -> pythonw.exe")
+    print("python embed", pye.name, pye.stat().st_size, pyw.name, pyw.stat().st_size)
+
+
+def verify_zip(dest_zip: Path) -> None:
+    required = {
+        "VideoUniqPro/VideoUniqPro.exe",
+        "VideoUniqPro/python/pythonw.exe",
+        "VideoUniqPro/python/python.exe",
+        "VideoUniqPro/python/python312._pth",
+        "VideoUniqPro/boot.py",
+        "VideoUniqPro/VideoUniqPro.bat",
+        "VideoUniqPro/src/videouniq/__init__.py",
+        "VideoUniqPro/python/Lib/site-packages/sitecustomize.py",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimedia.pyd",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimediaWidgets.pyd",
+    }
+    with zipfile.ZipFile(dest_zip) as zf:
+        names = set(zf.namelist())
+        pth = zf.read("VideoUniqPro/python/python312._pth").decode("utf-8", "replace")
+    missing = sorted(r for r in required if r not in names)
+    if missing:
+        raise RuntimeError("zip missing " + ", ".join(missing))
+    if "../src" not in pth.replace("\\", "/"):
+        raise RuntimeError("python312._pth must include ../src (embed ignores PYTHONPATH)")
+    mm = [n for n in names if "ffmpegmediaplugin" in n.lower() or n.endswith("QtMultimedia.pyd")]
+    if not any("ffmpegmediaplugin" in n.lower() for n in names):
+        raise RuntimeError("zip missing Qt FFmpeg multimedia plugin (player would be stills)")
+    print("zip verified", dest_zip, "multimedia", mm[:4])
 
 
 def patch_pth(python_dir: Path) -> None:
+    """Embeddable python*._pth ignores PYTHONPATH; src must be listed here."""
     pth = next(python_dir.glob("python*._pth"))
     text = pth.read_text(encoding="utf-8")
     lines = [ln for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    extras = ["Lib/site-packages", "import site"]
+    extras = ["Lib/site-packages", "../src", "import site"]
     for extra in extras:
         if extra not in lines:
             lines.append(extra)
+    # Keep "import site" last so sitecustomize can run.
+    if "import site" in lines:
+        lines = [ln for ln in lines if ln != "import site"] + ["import site"]
     pth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("patched", pth.name, "->", " | ".join(lines))
+
+
+def write_sitecustomize(python_dir: Path) -> None:
+    dest = python_dir / "Lib" / "site-packages" / "sitecustomize.py"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "scripts" / "windows_sitecustomize.py", dest)
+
+
+def copy_vc_redist(python_dir: Path) -> None:
+    """Put MSVC CRT next to python.exe so Qt/shiboken resolve without System32."""
+    src = python_dir / "Lib" / "site-packages" / "PySide6"
+    for name in (
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "msvcp140_codecvt_ids.dll",
+        "concrt140.dll",
+    ):
+        item = src / name
+        if item.is_file():
+            shutil.copy2(item, python_dir / name)
+
+
+def ensure_icu(python_dir: Path) -> None:
+    dest = python_dir / "Lib" / "site-packages" / "PySide6" / "resources" / "icudtl.dat"
+    if dest.is_file() and dest.stat().st_size > 1000:
+        return
+    wheel_dir = ROOT / "build" / "cache" / "wheels-win"
+    wheels = sorted(wheel_dir.glob("pyside6*.whl")) if wheel_dir.is_dir() else []
+    if not wheels:
+        return
+    name = "PySide6/resources/icudtl.dat"
+    with zipfile.ZipFile(wheels[0]) as zf:
+        if name not in zf.namelist():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(zf.read(name))
+        print("restored", dest, dest.stat().st_size)
+
+
+def finalize_python_runtime(python_dir: Path) -> None:
+    patch_pth(python_dir)
+    write_sitecustomize(python_dir)
+    copy_vc_redist(python_dir)
+    ensure_icu(python_dir)
 
 
 def install_wheels(python_dir: Path, wheel_dir: Path) -> None:
@@ -90,6 +235,7 @@ def install_wheels(python_dir: Path, wheel_dir: Path) -> None:
         "pip",
         "download",
         "PySide6_Essentials==6.12.0",
+        "PySide6_Addons==6.12.0",
         "shiboken6==6.12.0",
         "psutil==7.2.2",
         "--python-version",
@@ -170,11 +316,64 @@ def slim_pyside(pyside: Path) -> None:
         "uic.exe",
         "QtOpenGL.pyd",
         "QtOpenGL.pyi",
-        "resources/icudtl.dat",
         "plugins/sqldrivers/*",
         "translations/*.qm",
         "qml/**",
         "metatypes/**",
+        "Qt6WebEngine*.dll",
+        "Qt6WebChannel*.dll",
+        "Qt6WebView*.dll",
+        "Qt6WebSockets*.dll",
+        "Qt6Pdf*.dll",
+        "Qt6Charts*.dll",
+        "Qt6DataVisualization*.dll",
+        "Qt6Graphs*.dll",
+        "Qt63D*.dll",
+        "Qt6Bluetooth*.dll",
+        "Qt6Nfc*.dll",
+        "Qt6Positioning*.dll",
+        "Qt6Location*.dll",
+        "Qt6Sensors*.dll",
+        "Qt6Serial*.dll",
+        "Qt6RemoteObjects*.dll",
+        "Qt6TextToSpeech*.dll",
+        "Qt6HttpServer*.dll",
+        "Qt6StateMachine*.dll",
+        "Qt6Scxml*.dll",
+        "Qt6Quick3D*.dll",
+        "QtWebEngine*.pyd",
+        "QtWebChannel*.pyd",
+        "QtWebView*.pyd",
+        "QtWebSockets*.pyd",
+        "QtPdf*.pyd",
+        "QtCharts*.pyd",
+        "QtDataVisualization*.pyd",
+        "QtGraphs*.pyd",
+        "Qt3D*.pyd",
+        "QtBluetooth*.pyd",
+        "QtNfc*.pyd",
+        "QtPositioning*.pyd",
+        "QtLocation*.pyd",
+        "QtSensors*.pyd",
+        "QtSerial*.pyd",
+        "QtRemoteObjects*.pyd",
+        "QtTextToSpeech*.pyd",
+        "QtHttpServer*.pyd",
+        "QtStateMachine*.pyd",
+        "QtScxml*.pyd",
+        "QtQuick3D*.pyd",
+        "plugins/geoservices/*",
+        "plugins/sensors/*",
+        "plugins/position/*",
+        "plugins/canbus/*",
+        "plugins/renderers/*",
+        "plugins/sceneparsers/*",
+        "plugins/geometryloaders/*",
+        "plugins/webview/*",
+        "plugins/scxmldatamodel/*",
+        "plugins/texttospeech/*",
+        "Qt/qml/**",
+        "Qt/resources/qtwebengine*",
     ]
     removed = 0
     for pattern in drop_globs:
@@ -188,6 +387,23 @@ def slim_pyside(pyside: Path) -> None:
     print(f"slimmed PySide6 by {removed/1e6:.1f} MB")
     _upx_dir(pyside)
     _upx_dir(pyside / "plugins")
+    ensure_multimedia_plugins(pyside)
+
+
+def ensure_multimedia_plugins(pyside: Path) -> None:
+    """Qt looks at plugins/multimedia; Addons sometimes extract under Qt/plugins."""
+    dest = pyside / "plugins" / "multimedia"
+    dest.mkdir(parents=True, exist_ok=True)
+    for src in (pyside / "plugins" / "multimedia", pyside / "Qt" / "plugins" / "multimedia"):
+        if not src.is_dir():
+            continue
+        for item in src.iterdir():
+            if item.is_file():
+                target = dest / item.name
+                if item.resolve() != target.resolve():
+                    shutil.copy2(item, target)
+    if not any(dest.glob("*ffmpegmediaplugin*")):
+        print("WARNING: ffmpegmediaplugin missing after extract")
 
 
 def _upx_dir(folder: Path) -> None:
@@ -225,29 +441,45 @@ def zip_bundle(bundle: Path, dest_zip: Path) -> Path:
 
 def main() -> int:
     bundle = WORK / APP_NAME
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    bundle.mkdir(parents=True)
-    cache = ROOT / "build" / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-
-    py_zip = download(PY_URL, cache / f"python-{PY_VER}-embed-amd64.zip")
-    shared = cache / "ffmpeg-win64-gpl-shared.zip"
-    if shared.is_file() and shared.stat().st_size > 1_000_000:
-        ff_zip = shared
+    update_only = "--update" in sys.argv and (bundle / "python" / "python.exe").is_file()
+    if update_only:
+        print("update existing bundle", bundle)
+        ensure_pythonw(bundle / "python")
+        mm = bundle / "python" / "Lib" / "site-packages" / "PySide6" / "QtMultimedia.pyd"
+        if not mm.is_file():
+            print("QtMultimedia missing — installing Addons wheels")
+            install_wheels(bundle / "python", ROOT / "build" / "cache" / "wheels-win")
+            slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        else:
+            ensure_multimedia_plugins(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        finalize_python_runtime(bundle / "python")
+        copy_app(bundle)
     else:
-        ff_zip = download(FFMPEG_URL, cache / "ffmpeg-release-essentials.zip")
+        if WORK.exists():
+            shutil.rmtree(WORK)
+        bundle.mkdir(parents=True)
+        cache = ROOT / "build" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
 
-    python_dir = bundle / "python"
-    unzip(py_zip, python_dir)
-    patch_pth(python_dir)
-    install_wheels(python_dir, cache / "wheels-win")
-    place_ffmpeg(bundle, ff_zip)
-    copy_app(bundle)
-    slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        py_zip = download(PY_URL, cache / f"python-{PY_VER}-embed-amd64.zip")
+        shared = cache / "ffmpeg-win64-gpl-shared.zip"
+        if shared.is_file() and shared.stat().st_size > 1_000_000:
+            ff_zip = shared
+        else:
+            ff_zip = download(FFMPEG_URL, cache / "ffmpeg-release-essentials.zip")
+
+        python_dir = bundle / "python"
+        unzip(py_zip, python_dir)
+        ensure_pythonw(python_dir)
+        install_wheels(python_dir, cache / "wheels-win")
+        place_ffmpeg(bundle, ff_zip)
+        slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        finalize_python_runtime(python_dir)
+        copy_app(bundle)
 
     dest = DIST / ZIP_NAME
     zip_bundle(bundle, dest)
+    verify_zip(dest)
     print("OK", dest)
     return 0
 

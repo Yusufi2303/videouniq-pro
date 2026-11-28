@@ -6,8 +6,10 @@ from videouniq.core.params import UniqueParams
 
 DEVICE_LABELS = {
     "iphone_13": "iPhone 13",
+    "iphone_13_pro_max": "iPhone 13 Pro Max",
     "iphone_14": "iPhone 14",
     "iphone_15": "iPhone 15",
+    "iphone_15_pro_max": "iPhone 15 Pro Max",
     "iphone_16": "iPhone 16",
     "samsung_s23": "Samsung Galaxy S23",
     "samsung_s24": "Samsung Galaxy S24",
@@ -42,21 +44,32 @@ def metadata_pairs(params: UniqueParams, now: datetime | None = None) -> list[tu
     preset = params.device_preset
     if preset.startswith("iphone"):
         software = {
-            "iphone_13": "16.7.1",
+            "iphone_13": "16.7.11",
+            "iphone_13_pro_max": "17.6.1",
             "iphone_14": "17.5.1",
             "iphone_15": "18.1.1",
+            "iphone_15_pro_max": "18.2.1",
             "iphone_16": "18.2",
         }.get(preset, "18.1")
+        hw = {
+            "iphone_13": "iPhone14,5",
+            "iphone_13_pro_max": "iPhone14,3",
+            "iphone_14": "iPhone14,7",
+            "iphone_15": "iPhone15,4",
+            "iphone_15_pro_max": "iPhone16,2",
+            "iphone_16": "iPhone17,3",
+        }.get(preset, "iPhone15,4")
         pairs.extend(
             [
                 ("make", "Apple"),
                 ("model", label),
+                ("software", software),
                 ("copyright", "Apple"),
                 ("com.apple.quicktime.make", "Apple"),
                 ("com.apple.quicktime.model", label),
                 ("com.apple.quicktime.software", software),
                 ("com.apple.quicktime.creationdate", created),
-                ("encoder", f"Apple {label}"),
+                ("encoder", f"Apple {label} {software} ({hw})"),
             ]
         )
     elif preset.startswith("samsung"):

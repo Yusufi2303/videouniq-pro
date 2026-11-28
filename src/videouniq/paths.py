@@ -77,12 +77,30 @@ def config_dir() -> Path:
 
 
 def cache_dir() -> Path:
-    if sys.platform == "win32":
+    """Unified app cache: %LOCALAPPDATA%\\VideoUniqPro\\cache (or ~/.cache/VideoUniqPro/cache).
+
+    Override with VIDEOUNIQ_CACHE. Portable fallback: <app>/temp.
+    """
+    override = os.environ.get("VIDEOUNIQ_CACHE", "").strip()
+    if override:
+        path = Path(override)
+    elif sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        path = base / APP_ID / "Cache"
+        path = base / APP_ID / "cache"
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
-        path = base / APP_ID
+        path = base / APP_ID / "cache"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except OSError:
+        fallback = app_root() / "temp"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def cache_subdir(*parts: str) -> Path:
+    path = cache_dir().joinpath(*parts)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

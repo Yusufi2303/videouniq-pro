@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from videouniq.core.filters import build_filter_complex, output_duration
-from videouniq.core.hardware import EncoderChoice
+from videouniq.core.hardware import EncoderChoice, cpu_encoder, is_gpu_encode_error
 from videouniq.core.metadata import ffmpeg_metadata_args
 from videouniq.core.params import UniqueParams
 from videouniq.core.probe import MediaInfo
@@ -100,6 +100,126 @@ def _seconds_from_ts(value: str) -> float:
         return 0.0
 
 
+def demux_sanitize_args() -> list[str]:
+    """Rebuild timestamps from phone MP4s (VFR, edit lists). Do not use +igndts:
+
+    discarding DTS makes audio PTS = AV_NOPTS_VALUE (−2^63); x264 then finishes
+    and mux dies with Conversion failed.
+    """
+    return [
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-ignore_editlist",
+        "1",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-start_at_zero",
+    ]
+
+
+def wrap_input_files(paths: list[str]) -> list[str]:
+    args: list[str] = []
+    video_ext = {".mp4", ".mov", ".m4v", ".qt"}
+    for src in paths:
+        ext = Path(src).suffix.lower()
+        if ext in video_ext:
+            args += demux_sanitize_args()
+        args += ["-i", src]
+    return args
+
+
+_X264_NOISE = (
+    "mb I ",
+    "mb P ",
+    "mb B ",
+    "i16 v,h,dc,p",
+    "i8 v,h,dc",
+    "i4 v,h,dc",
+    "i8c dc,h,v,p",
+    "ref P L0",
+    "ref B L0",
+    "ref B L1",
+    "coded y,uvDC",
+    "direct mvs",
+    "8x8 transform",
+    "Weighted P-Frames",
+    "consecutive B-frames",
+    "frame I:",
+    "frame P:",
+    "frame B:",
+    "kb/s:",
+    "Qavg:",
+    "using cpu capabilities",
+    "profile High",
+    "264 - core",
+    "frame=  ",
+    "No accelerated colorspace",
+    "[swscaler @",
+)
+
+
+def ffmpeg_error_tail(stderr: str, limit: int = 30) -> str:
+    """Last useful ffmpeg lines, skipping libx264 stat tables."""
+    keep: list[str] = []
+    for raw in (stderr or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if any(tok in line for tok in _X264_NOISE):
+            continue
+        keep.append(line)
+    if keep:
+        return "\n".join(keep[-limit:])
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return "\n".join(lines[-limit:])
+
+
+def encode_stderr_failed(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    keys = (
+        "conversion failed",
+        "error while filtering",
+        "error muxing",
+        "failed to avoid negative timestamp",
+        "error submitting a packet",
+        "invalid argument",
+        "error opening",
+        "non-monotonic dts",
+        "922337203685477",
+        "cannot allocate memory",
+        "out of memory",
+        "not enough memory",
+    )
+    return any(k in s for k in keys)
+
+
+def is_oom_error(message: str) -> bool:
+    s = (message or "").lower()
+    return any(
+        k in s
+        for k in (
+            "cannot allocate memory",
+            "out of memory",
+            "not enough memory",
+            "std::bad_alloc",
+        )
+    )
+
+
+def mux_sanitize_args() -> list[str]:
+    return [
+        "-fps_mode",
+        "cfr",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-max_interleave_delta",
+        "0",
+        "-max_muxing_queue_size",
+        "1024",
+        "-shortest",
+    ]
+
+
 def container_output_args(params: UniqueParams, encoder_kind: str) -> list[str]:
     """Per-copy GOP, keyframe offset, timescale, and mux priming — hash-visible, eye-invisible."""
     args: list[str] = []
@@ -135,6 +255,16 @@ def _color_args(media: MediaInfo) -> list[str]:
     ]
 
 
+def finalize_filter_graph(graph: str, vout: str = "vout") -> tuple[str, str]:
+    """Force format=yuv420p immediately before the encoder map (NVENC/QSV/AMF)."""
+    label = vout.strip("[]") or "vout"
+    mapped = "v420"
+    if f"[{mapped}]" in graph:
+        mapped = "v420e"
+    finalized = f"{graph};[{label}]format=yuv420p[{mapped}]"
+    return finalized, f"[{mapped}]"
+
+
 def encode_copy(
     media: MediaInfo,
     params: UniqueParams,
@@ -145,6 +275,7 @@ def encode_copy(
     log_cb: LogCb | None = None,
     x264_threads: int = 0,
     graph_spec: object | None = None,
+    allow_cpu_fallback: bool = True,
 ) -> Path:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -152,9 +283,7 @@ def encode_copy(
     spec: GraphSpec | None = graph_spec if isinstance(graph_spec, GraphSpec) else None
     if spec is not None:
         graph = spec.graph
-        input_args: list[str] = []
-        for src in spec.inputs:
-            input_args += ["-i", src]
+        input_args = wrap_input_files(list(spec.inputs))
         has_audio = spec.has_audio
         color_media = spec.as_media(media.path)
         expected = max(0.2, spec.duration)
@@ -162,12 +291,13 @@ def encode_copy(
             expected = expected / params.tempo + max(0.0, params.aac_priming_ms) / 1000.0
     else:
         graph = build_filter_complex(media, params)
-        input_args = ["-i", media.path]
+        input_args = wrap_input_files([media.path])
         has_audio = media.has_audio
         color_media = media
         expected = max(0.2, output_duration(media, params))
 
-    maps = ["-map", "[vout]"]
+    graph, v_map = finalize_filter_graph(graph)
+    maps = ["-map", v_map]
     audio_args: list[str] = []
     if has_audio:
         maps += ["-map", "[aout]"]
@@ -175,103 +305,134 @@ def encode_copy(
     else:
         audio_args = ["-an"]
 
-    thread_args: list[str] = []
-    if encoder.kind == "cpu" and x264_threads > 0:
-        thread_args = ["-threads", str(x264_threads)]
+    encoders = [encoder]
+    if allow_cpu_fallback and encoder.kind != "cpu":
+        encoders.append(cpu_encoder())
 
-    cmd = [
-        ffmpeg_bin(),
-        "-hide_banner",
-        "-y",
-        "-nostdin",
-        *input_args,
-        "-filter_complex",
-        graph,
-        *maps,
-        "-c:v",
-        encoder.video_codec,
-        *encoder.extra,
-        *container_output_args(params, encoder.kind),
-        *thread_args,
-        "-pix_fmt",
-        "yuv420p",
-        *_color_args(color_media),
-        *audio_args,
-        *ffmpeg_metadata_args(params),
-        "-movflags",
-        "+faststart+use_metadata_tags",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        str(dest),
-    ]
+    last_error = ""
+    for attempt, enc in enumerate(encoders):
+        thread_args: list[str] = []
+        if enc.kind == "cpu" and x264_threads > 0:
+            thread_args = ["-threads", str(x264_threads)]
+        cmd = [
+            ffmpeg_bin(),
+            "-hide_banner",
+            "-y",
+            "-nostdin",
+            "-filter_threads",
+            "1",
+            "-filter_complex_threads",
+            "1",
+            *input_args,
+            "-filter_complex",
+            graph,
+            *maps,
+            "-c:v",
+            enc.video_codec,
+            *enc.extra,
+            *container_output_args(params, enc.kind),
+            *thread_args,
+            "-pix_fmt",
+            "yuv420p",
+            *_color_args(color_media),
+            *audio_args,
+            *ffmpeg_metadata_args(params),
+            *mux_sanitize_args(),
+            "-movflags",
+            "+faststart+use_metadata_tags",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            str(dest),
+        ]
 
-    if log_cb:
-        kind = "проект+уникализация" if spec is not None else encoder.label
-        log_cb(f"FFmpeg {kind} → {dest.name}")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+        if log_cb:
+            kind = "проект+уникализация" if spec is not None else enc.label
+            if attempt > 0:
+                log_cb(f"GPU недоступен, fallback {enc.label}")
+            log_cb(f"FFmpeg {kind} → {dest.name}")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
-    err_chunks: list[str] = []
-    store: dict[str, str] = {}
+        err_chunks: list[str] = []
+        store: dict[str, str] = {}
 
-    def _drain_err() -> None:
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            err_chunks.append(line)
-            if log_cb and ("error" in line.lower() or "failed" in line.lower()):
-                log_cb(line.rstrip())
+        def _drain_err() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                err_chunks.append(line)
+                if log_cb and ("error" in line.lower() or "failed" in line.lower()):
+                    log_cb(line.rstrip())
 
-    err_thread = threading.Thread(target=_drain_err, daemon=True)
-    err_thread.start()
-
-    try:
-        assert proc.stdout is not None
-        for raw in proc.stdout:
-            if stop_event is not None and stop_event.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise JobCancelled("Остановлено")
-            line = raw.strip()
-            _parse_progress_line(line, store)
-            if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
-                current = _seconds_from_ts(store.get("out_time_us") or "")
-                if current <= 0 and "out_time_ms" in store:
+        err_thread = threading.Thread(target=_drain_err, daemon=True)
+        err_thread.start()
+        code = 1
+        try:
+            assert proc.stdout is not None
+            for raw in proc.stdout:
+                if stop_event is not None and stop_event.is_set():
+                    proc.terminate()
                     try:
-                        current = float(store["out_time_ms"]) / 1_000_000
-                    except ValueError:
-                        current = 0.0
-                frac = min(0.99, current / expected) if expected else 0.0
-                if progress_cb:
-                    progress_cb(frac, "рендер")
-            if line == "progress=end":
-                break
-        code = proc.wait(timeout=30)
-    except JobCancelled:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise JobCancelled("Остановлено")
+                line = raw.strip()
+                _parse_progress_line(line, store)
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    current = _seconds_from_ts(store.get("out_time_us") or "")
+                    if current <= 0 and "out_time_ms" in store:
+                        try:
+                            current = float(store["out_time_ms"]) / 1_000_000
+                        except ValueError:
+                            current = 0.0
+                    frac = min(0.99, current / expected) if expected else 0.0
+                    if progress_cb:
+                        progress_cb(frac, "рендер")
+                if line == "progress=end":
+                    break
+            try:
+                code = proc.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=8)
+                code = -1
+                err_chunks.append("ffmpeg mux timeout after encode\n")
+        except JobCancelled:
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+            raise
+        finally:
+            err_thread.join(timeout=30)
+
+        err_text = "".join(err_chunks)
+        ok_file = dest.is_file() and dest.stat().st_size >= 64
+        if code == 0 and ok_file and not encode_stderr_failed(err_text):
+            append_padding(dest, params.pad_bytes)
+            if progress_cb:
+                progress_cb(1.0, "готово")
+            return dest
+
+        last_error = ffmpeg_error_tail(err_text) or f"ffmpeg exit {code}"
         if dest.exists():
             dest.unlink(missing_ok=True)
-        raise
-    finally:
-        err_thread.join(timeout=2)
+        can_retry = (
+            attempt == 0
+            and allow_cpu_fallback
+            and enc.kind != "cpu"
+            and is_gpu_encode_error(last_error)
+        )
+        if not can_retry:
+            raise RuntimeError(last_error)
+        if log_cb:
+            log_cb(f"Ошибка GPU ({last_error.splitlines()[-1] if last_error else 'encode'}), CPU libx264")
 
-    if code != 0 or not dest.is_file() or dest.stat().st_size < 64:
-        err = "".join(err_chunks[-12:]).strip() or f"ffmpeg exit {code}"
-        if dest.exists():
-            dest.unlink(missing_ok=True)
-        raise RuntimeError(err)
-
-    append_padding(dest, params.pad_bytes)
-    if progress_cb:
-        progress_cb(1.0, "готово")
-    return dest
+    raise RuntimeError(last_error or "encode failed")
 
 
 def uniquize_source(

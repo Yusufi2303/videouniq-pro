@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from videouniq.core.probe import collect_videos, is_video_file
+from videouniq.core.probe import collect_videos
 from videouniq.editor.project import EditorProject, TextClip
 
 
@@ -43,7 +43,7 @@ class MediaBin(QWidget):
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(self._add_selected)
         layout.addWidget(self.list, 1)
-        hint = QLabel("Перетащите видео сюда или дважды кликните, чтобы положить на дорожку.")
+        hint = QLabel("Импорт или перетаскивание добавляет ролик в конец дорожки. Двойной клик — ещё один кусок.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #9CA3AF; font-size: 11px;")
         layout.addWidget(hint)
@@ -84,8 +84,12 @@ class MediaBin(QWidget):
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
         paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
         videos = collect_videos(paths) if paths else []
-        extra = [Path(p) for p in paths if Path(p).is_file() and is_video_file(p)]
-        for p in list(videos) + extra:
+        seen: set[str] = set()
+        for p in videos:
+            key = str(Path(p).resolve())
+            if key in seen:
+                continue
+            seen.add(key)
             self.add_clip_requested.emit(str(p))
         event.acceptProposedAction()
 
