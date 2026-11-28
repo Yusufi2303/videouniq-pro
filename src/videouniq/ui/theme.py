@@ -96,6 +96,29 @@ QFrame#Timeline {{
 QWidget#CanvasHost {{
   background: #0B0D10;
 }}
+QWidget#CanvasOverlay {{
+  background: transparent;
+}}
+QDialog#UniquenessDialog {{
+  background: {c["surface"]};
+  color: {c["text"]};
+}}
+QTableWidget#UniquenessTable {{
+  background: {c["surface2"]};
+  color: {c["text"]};
+  gridline-color: {c["border"]};
+  border: 1px solid {c["border"]};
+  border-radius: 8px;
+}}
+QTableWidget#UniquenessTable::item {{
+  padding: 6px;
+}}
+QHeaderView::section {{
+  background: {c["surface"]};
+  color: {c["muted"]};
+  border: none;
+  padding: 6px;
+}}
 QSlider#VolumeSlider::groove:horizontal {{
   height: 4px;
 }}

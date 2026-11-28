@@ -18,6 +18,7 @@ from videouniq.ui.file_card import open_path
 
 class HistoryPage(QWidget):
     open_folder_requested = Signal(str)
+    report_requested = Signal(str, str)  # source, output_dir
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -83,7 +84,18 @@ class HistoryPage(QWidget):
             btn = QPushButton("Папка")
             btn.setObjectName("GhostButton")
             path = str(rec.get("path") or "")
+            source = str(rec.get("source") or rec.get("name") or "")
             btn.clicked.connect(lambda _=False, p=path: open_path(p) if p else None)
             btn.setEnabled(bool(path) and Path(path).exists())
             hl.addWidget(btn)
+            report_btn = QPushButton("Отчёт")
+            report_btn.setObjectName("GhostButton")
+            folder = path if Path(path).is_dir() else str(Path(path).parent) if path else ""
+            report_btn.clicked.connect(
+                lambda _=False, src=source, p=folder: self.report_requested.emit(src, p)
+            )
+            report_btn.setEnabled(
+                str(rec.get("kind") or "") in {"uniquize", "project"} and bool(folder) and Path(folder).exists()
+            )
+            hl.addWidget(report_btn)
             self.list_l.insertWidget(self.list_l.count() - 1, row)

@@ -63,7 +63,7 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "scripts" / "windows_boot.py", dest / "boot.py")
     exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro 2.1.5 — портативная сборка для Windows 10/11 x64.\r\n"
+        "VideoUniq Pro 2.2.1 — портативная сборка для Windows 10/11 x64.\r\n"
         "1. Распакуйте ВСЮ папку на рабочий стол (python, src, vendor рядом с .exe).\r\n"
         "2. Запустите VideoUniqPro.exe из этой папки (без чёрной консоли).\r\n"
         "   Не копируйте только .exe — Python ищется рядом с ним, не из другой папки.\r\n"

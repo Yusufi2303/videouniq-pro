@@ -37,6 +37,7 @@ class QueueView(QWidget):
     open_requested = Signal(str)
     browse_requested = Signal()
     return_requested = Signal(str)
+    report_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -120,6 +121,7 @@ class QueueView(QWidget):
                 card.remove_requested.connect(self.remove_requested)
                 card.open_requested.connect(self.open_requested)
                 card.return_requested.connect(self.return_requested)
+                card.report_requested.connect(self.report_requested)
                 self._cards[item.item_id] = card
                 self.list_layout.addWidget(card)
             else:

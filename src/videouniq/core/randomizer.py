@@ -47,22 +47,91 @@ def _is_hard(ranges: ManualRanges) -> bool:
     return ranges.crop_max >= 2.0 or ranges.rotate_max >= 0.38
 
 
+def fps_catalog(src_fps: float, delta: float = 0.04) -> list[float]:
+    """Nearby FPS values that never equal the source rate."""
+    src = float(src_fps or 0)
+    if abs(src - 30) < 0.05:
+        catalog = [29.97, 30.03, 29.94, 30.04, 29.96, 30.02, 29.92, 30.08]
+    elif abs(src - 60) < 0.05:
+        catalog = [59.94, 60.06, 59.97, 60.03, 59.90, 60.10, 59.88, 60.12]
+    elif abs(src - 24) < 0.05:
+        catalog = [23.976, 24.04, 23.98, 24.02, 23.94, 24.06, 23.92, 24.08]
+    elif abs(src - 25) < 0.05:
+        catalog = [24.96, 25.04, 24.92, 25.08, 24.88, 25.12, 24.84, 25.16]
+    else:
+        step = max(0.02, float(delta) * 0.5 if delta > 0 else 0.04)
+        catalog = []
+        k = 1
+        while len(catalog) < 8:
+            for sign in (-1, 1):
+                val = round(src + sign * step * k, 3)
+                if val > 1.0 and abs(val - src) > 0.015:
+                    catalog.append(val)
+            k += 1
+    out: list[float] = []
+    for val in catalog:
+        if abs(val - src) <= 0.015:
+            continue
+        if any(abs(val - x) < 0.008 for x in out):
+            continue
+        out.append(round(val, 3))
+    return out
+
+
+def unique_fps_targets(src_fps: float, count: int, delta: float = 0.04) -> list[float]:
+    src = float(src_fps or 25.0)
+    cat = fps_catalog(src, delta)
+    out: list[float] = []
+    i = 0
+    while len(out) < count and i < max(count * 8, 32):
+        if i < len(cat):
+            val = cat[i]
+        else:
+            k = i - len(cat) + 1
+            sign = -1 if k % 2 else 1
+            val = round(src + sign * (0.04 * ((k + 1) // 2) + 0.20), 3)
+        i += 1
+        if val <= 1.0 or abs(val - src) <= 0.015:
+            continue
+        if any(abs(val - x) < 0.008 for x in out):
+            continue
+        out.append(val)
+    while len(out) < count:
+        val = round(src + 0.04 * (len(out) + 1), 3)
+        if abs(val - src) <= 0.015:
+            val = round(src + 0.08 + 0.04 * len(out), 3)
+        out.append(val)
+    return out[:count]
+
+
+def unique_devices(enabled: list[str] | None, count: int, rng: random.Random) -> list[str]:
+    pool = [d for d in (enabled or list(DEVICE_PRESETS)) if d in DEVICE_PRESETS]
+    if not pool:
+        pool = list(DEVICE_PRESETS)
+    order = list(pool)
+    rng.shuffle(order)
+    out: list[str] = []
+    while len(out) < count:
+        chunk = list(order)
+        rng.shuffle(chunk)
+        # Avoid adjacent wrap repeating the last assigned device when possible.
+        if out and len(chunk) > 1 and chunk[0] == out[-1]:
+            chunk[0], chunk[1] = chunk[1], chunk[0]
+        out.extend(chunk)
+    return out[:count]
+
+
 def _fps_target(src_fps: float, delta: float, rng: random.Random) -> float | None:
+    cat = fps_catalog(src_fps, delta)
+    if cat:
+        return rng.choice(cat)
     if src_fps <= 0 or delta <= 0:
         return None
-    catalog = []
-    if abs(src_fps - 30) < 0.05:
-        catalog = [29.97, 30.03, 29.94, 30.04, 29.96, 30.02]
-    elif abs(src_fps - 60) < 0.05:
-        catalog = [59.94, 60.06, 59.97, 60.03]
-    elif abs(src_fps - 24) < 0.05:
-        catalog = [23.976, 24.04, 23.98, 24.02]
-    elif abs(src_fps - 25) < 0.05:
-        catalog = [24.96, 25.04, 24.98, 25.03]
-    if catalog:
-        return rng.choice(catalog)
     sign = -1 if rng.random() < 0.5 else 1
-    return round(src_fps + sign * rng.uniform(delta * 0.4, delta), 3)
+    val = round(src_fps + sign * rng.uniform(max(delta * 0.4, 0.02), max(delta, 0.04)), 3)
+    if abs(val - src_fps) <= 0.015:
+        val = round(src_fps + 0.04, 3)
+    return val
 
 
 def generate_params(
@@ -182,6 +251,56 @@ def generate_params(
     return params
 
 
+def _assign_batch_uniques(
+    out: list[UniqueParams],
+    media: MediaInfo,
+    flags: ModuleFlags,
+    ranges: ManualRanges,
+    enabled_devices: list[str] | None,
+    size_mode: str,
+) -> None:
+    """No repeated device/FPS/pad within one batch; never keep source FPS."""
+    rng = _rng(media.path, 0, salt=7)
+    devices = unique_devices(enabled_devices, len(out), rng)
+    fps_list = unique_fps_targets(media.fps, len(out), ranges.fps_delta)
+    seen_pad: set[int] = set()
+    seen_dur: list[float] = []
+    br = int(getattr(media, "bit_rate", 0) or 0)
+    if br <= 0 and media.duration > 0.2 and media.size_bytes > 1000:
+        total = int(media.size_bytes * 8 / media.duration)
+        br = max(80_000, total - (128_000 if media.has_audio else 0))
+    for i, params in enumerate(out):
+        params.device_preset = devices[i]
+        if flags.fps:
+            params.fps_target = fps_list[i]
+        pad = 96 + i * 173 + (params.pad_bytes % 37)
+        while pad in seen_pad:
+            pad += 19
+        seen_pad.add(pad)
+        params.pad_bytes = pad
+        if flags.grain:
+            params.grain_seed = ((params.grain_seed or 1) + (i + 1) * 104729) & 0x7FFFFFFF or 1
+        if flags.overlay:
+            params.overlay_seed = ((params.overlay_seed or 1) + (i + 1) * 6271) & 0x7FFFFFFF or 1
+        if flags.tempo and params.tempo:
+            dur = max(0.2, media.duration / params.tempo - params.trim_start - params.trim_end)
+        else:
+            dur = max(0.2, media.duration - params.trim_start - params.trim_end)
+        guard = 0
+        while (
+            any(abs(dur - d) < 0.012 for d in seen_dur) or abs(dur - media.duration) < 0.012
+        ) and guard < 12:
+            params.trim_end = round(params.trim_end + 0.018, 3)
+            dur = max(0.2, media.duration / max(params.tempo, 0.5) - params.trim_start - params.trim_end)
+            guard += 1
+        seen_dur.append(dur)
+        if size_mode == "smart" and br > 0:
+            factor = 1.15 + (i % 5) * 0.0375  # 1.15 … 1.30
+            params.maxrate_bps = int(br * factor)
+        else:
+            params.maxrate_bps = 0
+
+
 def generate_unique_set(
     media: MediaInfo,
     count: int,
@@ -189,6 +308,7 @@ def generate_unique_set(
     flags: ModuleFlags | None = None,
     ranges: ManualRanges | None = None,
     enabled_devices: list[str] | None = None,
+    size_mode: str = "quality",
 ) -> list[UniqueParams]:
     active_flags = flags or flags_for_preset(preset)
     active_ranges = (ranges or ranges_for_preset(preset)).clamp()
@@ -219,6 +339,7 @@ def generate_unique_set(
             chosen.noise_seed = (chosen.noise_seed + 104729 * (i + 1)) & 0x7FFFFFFF
             seen.add(chosen.fingerprint())
         out.append(chosen)
+    _assign_batch_uniques(out, media, active_flags, active_ranges, enabled_devices, size_mode)
     return out
 
 

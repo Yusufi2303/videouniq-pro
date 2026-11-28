@@ -17,11 +17,11 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSlider,
-    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
@@ -124,11 +124,14 @@ class CanvasWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("CanvasHost")
+        self.setObjectName("CanvasOverlay")
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self._on_resize = None
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.frame = QPixmap()
@@ -178,12 +181,17 @@ class CanvasWidget(QWidget):
         p = QPainter(self)
         rect = self.canvas_rect()
         if self.live_video:
-            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            # Opaque letterbox; only the video rectangle is a hole onto QVideoWidget.
+            p.fillRect(self.rect(), QColor("#0B0D10"))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+            p.fillRect(rect, QColor(0, 0, 0, 0))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         else:
             p.fillRect(self.rect(), QColor("#0B0D10"))
             p.fillRect(rect, QColor("#111318"))
             if not self.frame.isNull():
-                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                # Fast blit — SmoothPixmapTransform on every frame looked like a proxy.
+                p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
                 p.drawPixmap(rect.toRect(), self.frame)
         if self._guides:
             pen = QPen(QColor("#3B82F6"))
@@ -205,6 +213,11 @@ class CanvasWidget(QWidget):
             p.setPen(QColor("#E5E7EB"))
             p.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), "Загрузка кадра…")
         p.end()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if callable(self._on_resize):
+            self._on_resize()
 
     def _text_image(self, clip: TextClip) -> QImage | None:
         if self.project is None:
@@ -366,17 +379,20 @@ class PreviewPlayer(QWidget):
 
         host = QWidget()
         host.setObjectName("CanvasHost")
-        stack = QStackedLayout(host)
-        stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        host.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
         self._video_host = QWidget()
         self._video_host.setStyleSheet("background: #0B0D10;")
-        vh = QVBoxLayout(self._video_host)
-        vh.setContentsMargins(0, 0, 0, 0)
-        stack.addWidget(self._video_host)
+        self._video_host.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        grid.addWidget(self._video_host, 0, 0)
         self.canvas = CanvasWidget()
+        self.canvas._on_resize = self._sync_video_geom
         self.canvas.selection_changed.connect(self.selection_changed.emit)
         self.canvas.text_changed.connect(self.project_changed.emit)
-        stack.addWidget(self.canvas)
+        grid.addWidget(self.canvas, 0, 0)
+        self._host = host
         layout.addWidget(host, 1)
 
         controls = QHBoxLayout()
@@ -427,25 +443,34 @@ class PreviewPlayer(QWidget):
 
     def _init_backend(self) -> None:
         try:
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+            from PySide6.QtMultimediaWidgets import QVideoWidget
 
             self._audio = QAudioOutput(self)
             self._audio.setVolume(0.85)
             self._audio.setMuted(False)
-            self._sink = QVideoSink(self)
-            self._sink.videoFrameChanged.connect(self._on_video_frame)
+            self._video = QVideoWidget(self._video_host)
+            self._video.setStyleSheet("background: #0B0D10;")
+            self._video.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+            try:
+                self._video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+            except Exception:
+                pass
             self._qt_player = QMediaPlayer(self)
             self._qt_player.setAudioOutput(self._audio)
-            self._qt_player.setVideoOutput(self._sink)
+            self._qt_player.setVideoOutput(self._video)
             self._qt_player.positionChanged.connect(self._on_pos)
             self._qt_player.mediaStatusChanged.connect(self._on_status)
             try:
                 self._qt_player.errorOccurred.connect(self._on_qt_error)
             except Exception:
                 pass
-            self._video_host.hide()
+            self._video_host.show()
+            self._video.show()
             self.backend = "qt"
-            self.canvas.live_video = False
+            self.canvas.live_video = True
+            self._sink = None
+            self._sync_video_geom()
         except Exception:
             self._qt_player = None
             self._audio = None
@@ -454,6 +479,14 @@ class PreviewPlayer(QWidget):
             self.backend = "ffmpeg"
             self.canvas.live_video = False
         self.backend_lab.setText(self._backend_label())
+
+    def _sync_video_geom(self) -> None:
+        if self._video is None:
+            return
+        rect = self.canvas.canvas_rect().toRect()
+        if rect.width() < 16 or rect.height() < 16:
+            rect = self._video_host.rect()
+        self._video.setGeometry(rect)
 
     def set_project(self, project: EditorProject) -> None:
         self.project = project
@@ -465,6 +498,7 @@ class PreviewPlayer(QWidget):
             self.aspect.blockSignals(False)
         self.set_playhead(min(self.playhead, timeline_duration(project)))
         self._prepare_proxies(project)
+        self._sync_video_geom()
 
     def _on_aspect(self) -> None:
         if self.project is None:
@@ -505,6 +539,8 @@ class PreviewPlayer(QWidget):
                 self._qt_player.setPlaybackRate(1.0)
             except Exception:
                 pass
+            self.canvas.live_video = True
+            self._sync_video_geom()
             self._qt_player.play()
             self._timer.stop()
             self._stuck = 0
@@ -540,17 +576,6 @@ class PreviewPlayer(QWidget):
             self.canvas.update()
             return
         self.refresh_frame()
-
-    def _on_video_frame(self, frame) -> None:
-        try:
-            if frame is None or not frame.isValid():
-                return
-            img = frame.toImage()
-        except Exception:
-            return
-        if img.isNull():
-            return
-        self.canvas.set_frame(QPixmap.fromImage(img))
 
     def _on_qt_error(self, *_args) -> None:
         if self._qt_player is None:

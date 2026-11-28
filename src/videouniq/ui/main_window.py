@@ -22,7 +22,7 @@ from videouniq import __app_name__, __version__
 from videouniq.core.hardware import detect_hardware, ram_gb, recommended_encode_workers, encoder_with_quality
 from videouniq.core.params import ManualRanges, ModuleFlags, UniqueParams, flags_for_preset, ranges_for_preset
 from videouniq.core.pipeline import encode_copy, extract_preview, preview_cache_path
-from videouniq.core.probe import collect_videos, probe_media
+from videouniq.core.probe import VIDEO_EXTENSIONS, collect_videos, probe_media
 from videouniq.core.randomizer import generate_unique_set, output_folder_name
 from videouniq.editor.export import (
     cleanup_on_quit,
@@ -46,6 +46,8 @@ from videouniq.ui.queue_view import QueueView
 from videouniq.ui.right_panel import RightPanel
 from videouniq.ui.sidebar import Sidebar
 from videouniq.ui.theme import apply_theme
+from videouniq.ui.uniqueness_dialog import UniquenessDialog
+from videouniq.core.auditor import quick_audit, save_report
 
 
 class ProbeBridge(QObject):
@@ -161,10 +163,14 @@ class MainWindow(QMainWindow):
         self.queue.remove_requested.connect(self.remove_item)
         self.queue.open_requested.connect(self._open_item_folder)
         self.queue.return_requested.connect(self._return_to_editor)
+        self.queue.report_requested.connect(self._open_uniqueness)
+        self.history_page.report_requested.connect(self._open_uniqueness_path)
         self.right.start_requested.connect(self.start_render)
         self.right.stop_requested.connect(self.controller.stop)
         self.right.save_preset_requested.connect(self._save_custom_preset)
         self.right.zip_requested.connect(self._zip_outputs)
+        self.right.size_mode_changed.connect(self._sync_size_from_right)
+        self.render_page.changed.connect(self._sync_size_from_render)
         self.render_page.theme_changed.connect(self._set_dark)
         self.render_page.cache_clear_requested.connect(self._clear_cache)
         self.editor.send_to_uniquizer.connect(self._from_editor)
@@ -209,6 +215,10 @@ class MainWindow(QMainWindow):
         self.sidebar.set_hardware(f"GPU: {gpu}\n{choice.label}")
         self.render_page.set_hardware_info(text)
         self.logs_page.append(f"Аппаратный энкодер: {choice.label}")
+        if choice.kind == "nvenc":
+            self.logs_page.append("Авто: NVIDIA NVENC имеет приоритет над Intel QSV")
+        elif choice.kind == "qsv":
+            self.logs_page.append("Intel QSV: NVIDIA NVENC недоступен или не прошёл проверку")
         self.logs_page.append(
             f"RAM {ram_gb():.0f} ГБ · потоков уникализации: {self.render_page.thread_count()} "
             f"(рекомендуется {recommended_encode_workers()})"
@@ -239,6 +249,11 @@ class MainWindow(QMainWindow):
         dark = str(self.settings.value("dark", "1")) != "0"
         self.render_page.dark_toggle.setChecked(dark, emit=False)
         self._dark = dark
+        size_mode = str(self.settings.value("size_mode", "quality") or "quality")
+        if size_mode not in {"quality", "smart"}:
+            size_mode = "quality"
+        self.render_page.set_size_mode(size_mode)
+        self.right.set_size_mode(size_mode)
 
     def _set_dark(self, dark: bool) -> None:
         self._dark = bool(dark)
@@ -246,6 +261,22 @@ class MainWindow(QMainWindow):
         if app:
             apply_theme(app, dark=self._dark)
         self.settings.setValue("dark", "1" if dark else "0")
+
+    def _sync_size_from_right(self) -> None:
+        key = self.right.size_mode()
+        if self.render_page.size_mode() != key:
+            self.render_page.blockSignals(True)
+            self.render_page.set_size_mode(key)
+            self.render_page.blockSignals(False)
+        self.settings.setValue("size_mode", key)
+
+    def _sync_size_from_render(self) -> None:
+        key = self.render_page.size_mode()
+        if self.right.size_mode() != key:
+            self.right.blockSignals(True)
+            self.right.set_size_mode(key)
+            self.right.blockSignals(False)
+        self.settings.setValue("size_mode", key)
 
     def _browse_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -303,6 +334,58 @@ class MainWindow(QMainWindow):
         if item and item.output_dir:
             open_path(item.output_dir)
 
+    def _open_uniqueness(self, item_id: str) -> None:
+        item = self._find(item_id)
+        if item is None or not item.output_dir:
+            QMessageBox.information(self, __app_name__, "Сначала завершите уникализацию.")
+            return
+        self._open_uniqueness_path(item.path, item.output_dir)
+
+    def _open_uniqueness_path(self, source: str, output_dir: str) -> None:
+        folder = output_dir
+        p = Path(output_dir)
+        if p.is_file():
+            folder = str(p.parent)
+            if not source:
+                source = str(p)
+        if not Path(folder).is_dir():
+            QMessageBox.warning(self, __app_name__, "Папка с копиями не найдена.")
+            return
+        src = source or folder
+        if Path(src).suffix.lower() == ".vup":
+            from videouniq.editor.project import EditorProject
+
+            try:
+                proj = EditorProject.load(src)
+                if proj.video_clips:
+                    src = proj.video_clips[0].source_path
+            except Exception:
+                pass
+        dlg = UniquenessDialog(src, folder, self)
+        dlg.exec()
+
+    def _media_with_bitrate(self, item: FileItem):
+        from dataclasses import replace
+
+        info = item.info
+        if info is None:
+            return info
+        path = item.path
+        if item.kind == "project" and item.project_dict:
+            clips = item.project_dict.get("video_clips") or []
+            if clips and clips[0].get("source_path"):
+                path = str(clips[0]["source_path"])
+        src = Path(path)
+        if src.suffix.lower() not in VIDEO_EXTENSIONS or not src.is_file():
+            return info
+        if info.bit_rate > 0 and info.size_bytes > 0:
+            return info
+        try:
+            probed = probe_media(src)
+        except Exception:
+            return info
+        return replace(info, bit_rate=probed.bit_rate, size_bytes=probed.size_bytes or info.size_bytes)
+
     def _find(self, item_id: str) -> FileItem | None:
         return next((it for it in self.items if it.item_id == item_id), None)
 
@@ -333,6 +416,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("output_dir", str(root))
         self.settings.setValue("threads", self.render_page.thread_count())
         self.settings.setValue("encoder", self.render_page.encoder_key())
+        size_mode = self.right.size_mode()
+        self.settings.setValue("size_mode", size_mode)
 
         preference = self.render_page.encoder_key()
         detected = detect_hardware(preference)
@@ -345,18 +430,26 @@ class MainWindow(QMainWindow):
         )
         self.logs_page.append(f"Выход: {root}")
         self.logs_page.append(f"Пресет: {preset}, копий: {copies}, энкодер: {encoder.label}")
+        if size_mode == "smart":
+            self.logs_page.append("Контроль веса: умный битрейт (−maxrate 115–130% оригинала, AAC 320 кбит/с)")
+        else:
+            self.logs_page.append("Контроль веса: максимальное качество (CRF / CQ)")
 
         params_map = {}
         self._copy_progress = {}
         for item in ready:
             assert item.info is not None
+            media = item.info
+            if size_mode == "smart":
+                media = self._media_with_bitrate(item)
             params_map[item.item_id] = generate_unique_set(
-                item.info,
+                media,
                 copies,
                 preset,
                 flags=flags,
                 ranges=ranges,
                 enabled_devices=self.meta_page.enabled_devices(),
+                size_mode=size_mode,
             )
             item.status = FileStatus.RENDERING
             item.progress = 0.0
@@ -415,6 +508,20 @@ class MainWindow(QMainWindow):
             item.status = FileStatus.DONE
             item.progress = 1.0
             item.message = "Готово"
+            if item.output_dir:
+                try:
+                    source = item.path
+                    if item.kind == "project" and item.project_dict:
+                        clips = item.project_dict.get("video_clips") or []
+                        if clips and clips[0].get("source_path"):
+                            source = str(clips[0]["source_path"])
+                    report = quick_audit(source, item.output_dir)
+                    save_report(report)
+                    self.logs_page.append(
+                        f"Отчёт уникальности: {report.verdict_label} ({report.elapsed_ms:.0f} мс)"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.logs_page.append(f"Отчёт уникальности не собран: {exc}")
         elif self.controller._stop.is_set():
             item.status = FileStatus.CANCELLED
         elif item.error:
@@ -436,6 +543,7 @@ class MainWindow(QMainWindow):
                         Path(item.path).name,
                         item.output_dir,
                         copies=item.copies_done,
+                        extra={"source": item.path},
                     )
             self.history_page.reload()
         self._refresh_queue()

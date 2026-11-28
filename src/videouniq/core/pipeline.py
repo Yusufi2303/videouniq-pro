@@ -40,6 +40,15 @@ def file_md5(path: str | Path, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def _maxrate_args(params) -> list[str]:
+    """CRF/CQ stay; VBV cap only when smart size control set a per-copy maxrate."""
+    rate = int(getattr(params, "maxrate_bps", 0) or 0)
+    if rate < 80_000:
+        return []
+    buf = max(rate * 2, rate + 80_000)
+    return ["-maxrate", str(rate), "-bufsize", str(buf)]
+
+
 def append_padding(path: str | Path, nbytes: int) -> None:
     n = max(16, int(nbytes))
     with Path(path).open("ab") as fh:
@@ -330,6 +339,7 @@ def encode_copy(
             "-c:v",
             enc.video_codec,
             *enc.extra,
+            *_maxrate_args(params),
             *container_output_args(params, enc.kind),
             *thread_args,
             "-pix_fmt",

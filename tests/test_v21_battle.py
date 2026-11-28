@@ -271,11 +271,12 @@ def main() -> int:
         check("asetpts=PTS-STARTPTS" in graph, "PTS reset")
         check("adelay=" in graph and "hue=h=" in graph and "anoisesrc=" in graph, "hard modules")
         check(":d=" in graph, "overlay duration capped")
-        from videouniq.core.hardware import recommended_encode_workers
+        from videouniq.core.hardware import auto_encoder_priority, recommended_encode_workers
         from videouniq.core.pipeline import is_oom_error
         from videouniq.editor.proxy import ensure_stream_copy
 
         check(recommended_encode_workers() in (1, 2), recommended_encode_workers())
+        check(auto_encoder_priority()[0] == "nvenc", "NVIDIA before Intel QSV")
         check(is_oom_error("Error while filtering: Cannot allocate memory"), "oom detect")
         copied = Path(ensure_stream_copy(phone))
         cinfo = probe_media(copied)
@@ -316,6 +317,13 @@ def main() -> int:
         check(loaded.text_clips[0].text == "Боевой тест", "vup roundtrip")
         media = probe_media(speech)
         copies = generate_unique_set(media, 5, "optimal")
+        check(len({p.device_preset for p in copies}) == 5, "unique devices in batch")
+        check(len({p.pad_bytes for p in copies}) == 5, "unique pad bytes")
+        check(
+            all(p.fps_target and abs(p.fps_target - media.fps) > 0.015 for p in copies),
+            [p.fps_target for p in copies],
+        )
+        check(len({round(float(p.fps_target or 0), 3) for p in copies}) == 5, "unique fps")
         check(len({p.gop_size for p in copies}) >= 2, "GOP varies")
         check(any(abs(p.hue_deg) > 0.01 for p in copies), "hue field present")
         check(any(p.eq_notch_hz for p in copies), "notch EQ")
@@ -333,6 +341,13 @@ def main() -> int:
             vd, ad = av_durations(dest)
             check(abs(vd - ad) < 0.40, f"A/V sync copy {i} v={vd:.3f} a={ad:.3f}")
         check(len(set(hashes)) == 5, hashes)
+        from videouniq.core.auditor import quick_audit, save_report
+
+        ureport = quick_audit(speech, out)
+        save_report(ureport)
+        check(ureport.verdict in {"unique", "warn"}, ureport.verdict_label)
+        check(len(ureport.copies) == 5, len(ureport.copies))
+        check(len(ureport.copies[0].md5) == 32, "auditor md5 is real hashlib")
         master_spec = build_edit_and_uniquize(loaded, None)
         master = out / "master.mp4"
         encode_copy(
