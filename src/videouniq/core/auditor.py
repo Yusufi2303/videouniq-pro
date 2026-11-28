@@ -15,7 +15,7 @@ from videouniq.paths import ffmpeg_bin, ffprobe_bin
 
 HAMMING_UNIQUE = 30
 SSIM_QUALITY = 0.95
-AHASH_SIZE = 8
+AHASH_SIZE = 16
 DEEP_FRAMES = 5
 REPORT_NAME = "uniqueness.json"
 
@@ -40,18 +40,19 @@ class FileIdentity:
 
     @property
     def duration_label(self) -> str:
-        total = max(0, int(round(self.duration)))
-        m, s = divmod(total, 60)
-        if m >= 60:
-            h, m = divmod(m, 60)
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m}:{s:02d}"
+        total_ms = max(0, int(round(float(self.duration) * 1000.0)))
+        minutes, rest = divmod(total_ms, 60_000)
+        seconds, ms = divmod(rest, 1000)
+        if minutes >= 60:
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}:{minutes:02d}:{seconds:02d}.{ms:03d}"
+        return f"{minutes:02d}:{seconds:02d}.{ms:03d}"
 
     @property
     def fps_label(self) -> str:
         if self.fps <= 0:
             return "—"
-        if abs(self.fps - round(self.fps)) < 0.03:
+        if abs(self.fps - round(self.fps)) < 0.005:
             return f"{int(round(self.fps))} FPS"
         return f"{self.fps:.2f} FPS"
 
@@ -351,14 +352,14 @@ def quick_audit(source: str | Path, output_dir: str | Path, timeout: float = 12.
             FieldCheck(
                 "duration",
                 "Длительность",
-                _vs_original_float(origin.duration, [c.duration for c in copy_rows], 0.04),
-                _unique_floats([c.duration for c in copy_rows], 0.04),
+                _vs_original_float(origin.duration, [c.duration for c in copy_rows], 0.008),
+                _unique_floats([c.duration for c in copy_rows], 0.008),
             ),
             FieldCheck(
                 "fps",
                 "FPS",
-                _vs_original_float(origin.fps, [c.fps for c in copy_rows], 0.02),
-                _unique_floats([c.fps for c in copy_rows], 0.02),
+                _vs_original_float(origin.fps, [c.fps for c in copy_rows], 0.008),
+                _unique_floats([c.fps for c in copy_rows], 0.008),
             ),
             FieldCheck(
                 "device",
@@ -471,32 +472,50 @@ def deep_audit(report: AuditReport) -> AuditReport:
         return report
     times = _frame_times(origin.duration or 1.0)
     orig_path = Path(origin.path)
-    pair_h: list[float] = []
+    cache: dict[tuple[str, float], int] = {}
+
+    def bits_at(path: Path, t: float) -> int:
+        key = (str(path), round(t, 4))
+        if key not in cache:
+            cache[key] = _ahash_bits(path, t, AHASH_SIZE)
+        return cache[key]
+
     vs_orig: list[float] = []
     ssim_vs: list[float] = []
-    for copy in copies:
+    pair_matrix: list[list[float]] = [[0.0] * len(copies) for _ in copies]
+    pair_h: list[float] = []
+    for i, copy in enumerate(copies):
         cpath = Path(copy.path)
-        h_orig: list[int] = []
-        for t in times:
-            h_orig.append(_hamming(_ahash_bits(orig_path, t), _ahash_bits(cpath, t)))
+        h_orig = [_hamming(bits_at(orig_path, t), bits_at(cpath, t)) for t in times]
         vs_orig.append(sum(h_orig) / len(h_orig))
         ssim_vs.append(sum(_ssim_pair(orig_path, cpath, t) for t in times) / len(times))
     for i in range(len(copies)):
         for j in range(i + 1, len(copies)):
             dists = [
-                _hamming(
-                    _ahash_bits(Path(copies[i].path), t),
-                    _ahash_bits(Path(copies[j].path), t),
-                )
+                _hamming(bits_at(Path(copies[i].path), t), bits_at(Path(copies[j].path), t))
                 for t in times
             ]
-            pair_h.append(sum(dists) / len(dists))
+            mean = sum(dists) / len(dists)
+            pair_matrix[i][j] = mean
+            pair_matrix[j][i] = mean
+            pair_h.append(mean)
     mean_pair = sum(pair_h) / len(pair_h) if pair_h else 0.0
     min_pair = min(pair_h) if pair_h else 0.0
     mean_orig = sum(vs_orig) / len(vs_orig) if vs_orig else 0.0
     mean_ssim = sum(ssim_vs) / len(ssim_vs) if ssim_vs else 0.0
-    visual_unique = min_pair > HAMMING_UNIQUE or mean_orig > HAMMING_UNIQUE
+    visual_unique = (min(vs_orig) if vs_orig else 0.0) > HAMMING_UNIQUE or min_pair > HAMMING_UNIQUE
     quality_ok = mean_ssim >= SSIM_QUALITY
+    per_copy = []
+    for i, copy in enumerate(copies):
+        others = [pair_matrix[i][j] for j in range(len(copies)) if j != i]
+        per_copy.append(
+            {
+                "index": copy.index,
+                "hamming_vs_original": round(vs_orig[i], 2),
+                "ssim_vs_original": round(ssim_vs[i], 4),
+                "hamming_vs_copies_mean": round(sum(others) / len(others), 2) if others else 0.0,
+            }
+        )
     report.deep = {
         "frames": len(times),
         "ahash_size": AHASH_SIZE,
@@ -509,6 +528,7 @@ def deep_audit(report: AuditReport) -> AuditReport:
         "visual_unique": visual_unique,
         "quality_ok": quality_ok,
         "times": [round(t, 3) for t in times],
+        "per_copy": per_copy,
     }
     return report
 
@@ -537,7 +557,13 @@ def format_text_report(report: AuditReport) -> str:
     if report.deep:
         deep = report.deep
         lines.append("")
-        lines.append("Глубокий анализ (aHash + SSIM):")
+        lines.append(f"Глубокий анализ (aHash {AHASH_SIZE}×{AHASH_SIZE} + SSIM):")
+        for row in deep.get("per_copy") or []:
+            lines.append(
+                f"  копия {row.get('index')}: Hamming vs оригинал {row.get('hamming_vs_original')}  "
+                f"между копиями {row.get('hamming_vs_copies_mean')}  "
+                f"SSIM {row.get('ssim_vs_original')}"
+            )
         lines.append(
             f"  Hamming vs оригинал (mean) {deep.get('hamming_vs_original_mean')} "
             f"(порог >{HAMMING_UNIQUE})"

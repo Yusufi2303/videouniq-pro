@@ -117,7 +117,15 @@ def main() -> int:
         md5_chk = next(c for c in report.checks if c.key == "md5")
         check(md5_chk.ok, md5_chk)
         device_chk = next(c for c in report.checks if c.key == "device")
-        check(device_chk.unique_among_copies or device_chk.unique_vs_original, device_chk)
+        check(device_chk.unique_among_copies, device_chk)
+        fps_chk = next(c for c in report.checks if c.key == "fps")
+        check(fps_chk.unique_among_copies, fps_chk)
+        check(all("." in row.duration_label for row in report.files), [r.duration_label for r in report.files])
+        src_fps = report.original.fps if report.original else 0
+        check(
+            all(abs(c.fps - src_fps) > 0.01 for c in report.copies),
+            [c.fps_label for c in report.copies],
+        )
         for row in report.files:
             check(len(row.md58) == 8, row.md58)
             check("stub" not in row.md5.lower(), row.md5)
@@ -140,10 +148,18 @@ def main() -> int:
         assert deep.deep is not None
         check("hamming_pairwise_mean" in deep.deep, deep.deep)
         check("ssim_vs_original_mean" in deep.deep, deep.deep)
+        check(int(deep.deep.get("ahash_size") or 0) == 16, deep.deep.get("ahash_size"))
+        per = deep.deep.get("per_copy") or []
+        check(len(per) == 3, per)
+        hams = [row["hamming_vs_original"] for row in per]
+        ssims = [row["ssim_vs_original"] for row in per]
+        check(len(set(hams)) >= 2 or len(set(ssims)) >= 2, f"per-copy metrics {hams} {ssims}")
+        check(all("hamming_vs_copies_mean" in row for row in per), per)
         ssim = float(deep.deep["ssim_vs_original_mean"])
         check(ssim >= 0.90, f"SSIM quality {ssim}")
         text2 = format_text_report(deep)
         check("Hamming" in text2 and "SSIM" in text2, text2)
+        check("копия 1" in text2 and "копия 2" in text2, text2)
 
         # Stub-guard: identities come from real files on disk, not constants.
         fake = tmp / "missing"

@@ -89,6 +89,20 @@ class RenderSettingsPage(QWidget):
         self.nv_preset.currentIndexChanged.connect(lambda _: self.changed.emit())
         layout.addWidget(self.nv_preset)
 
+        layout.addWidget(self._cap("Контроль веса файла"))
+        self.size_combo = QComboBox()
+        self.size_combo.addItem("Максимальное качество (CRF 17 / CQ 19)", "quality")
+        self.size_combo.addItem("Умный битрейт (Не раздувать вес)", "smart")
+        self.size_combo.currentIndexChanged.connect(lambda _: self.changed.emit())
+        layout.addWidget(self.size_combo)
+        size_hint = QLabel(
+            "Умный битрейт читает bit_rate оригинала и ставит −maxrate 1.15×–1.3×. "
+            "Лёгкий ролик не раздувается до CRF-размера; 4K/iPhone остаются резкими. AAC 320 кбит/с."
+        )
+        size_hint.setWordWrap(True)
+        size_hint.setStyleSheet("color: #9CA3AF; font-size: 12px;")
+        layout.addWidget(size_hint)
+
         theme_row = QHBoxLayout()
         theme_lab = QLabel("Тёмная тема")
         self.dark_toggle = ToggleSwitch(True)
@@ -135,6 +149,15 @@ class RenderSettingsPage(QWidget):
 
     def thread_count(self) -> int:
         return int(self.threads.currentData())
+
+    def size_mode(self) -> str:
+        return str(self.size_combo.currentData() or "quality")
+
+    def set_size_mode(self, key: str) -> None:
+        for i in range(self.size_combo.count()):
+            if self.size_combo.itemData(i) == key:
+                self.size_combo.setCurrentIndex(i)
+                return
 
     def set_hardware_info(self, text: str) -> None:
         self.hw_info.setText(text)

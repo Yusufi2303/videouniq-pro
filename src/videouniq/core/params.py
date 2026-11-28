@@ -148,6 +148,7 @@ class UniqueParams:
     creation_offset_hours: float = 24.0
     metadata_token: str = ""
     pad_bytes: int = 96
+    maxrate_bps: int = 0
     write_metadata: bool = True
     gop_size: int = 0
     keyframe_offset: float = 0.0

@@ -29,6 +29,7 @@ class MediaInfo:
     color_range: str
     audio_rate: int
     audio_channels: int
+    bit_rate: int = 0
 
     @property
     def name(self) -> str:
@@ -175,6 +176,25 @@ def probe_media(path: str | Path, timeout: float = 30.0) -> MediaInfo:
     if width <= 0 or height <= 0:
         raise RuntimeError("Не удалось определить разрешение")
 
+    bit_rate = 0
+    for candidate in (video.get("bit_rate"), fmt.get("bit_rate")):
+        if candidate:
+            try:
+                bit_rate = int(float(candidate))
+                if bit_rate > 0:
+                    break
+            except (TypeError, ValueError):
+                continue
+    if bit_rate <= 0 and duration > 0.2 and size_bytes > 1000:
+        bit_rate = int(size_bytes * 8 / duration)
+        audio_br = 0
+        try:
+            audio_br = int(float((audio or {}).get("bit_rate") or 0))
+        except (TypeError, ValueError):
+            audio_br = 0
+        if audio_br > 0:
+            bit_rate = max(80_000, bit_rate - audio_br)
+
     return MediaInfo(
         path=str(src.resolve()),
         width=width,
@@ -193,6 +213,7 @@ def probe_media(path: str | Path, timeout: float = 30.0) -> MediaInfo:
         color_range=_color(str(video.get("color_range") or ""), "tv"),
         audio_rate=int((audio or {}).get("sample_rate") or 48000),
         audio_channels=int((audio or {}).get("channels") or 2),
+        bit_rate=int(bit_rate),
     )
 
 

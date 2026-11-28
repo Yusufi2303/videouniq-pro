@@ -163,23 +163,25 @@ class UniquenessDialog(QDialog):
             ("Вес", [f.size_label for f in report.files]),
         ]
         if report.deep:
-            ham = [
-                "порог >30"
-                if f.role == "original"
-                else str(report.deep.get("hamming_vs_original_mean", "—"))
-                if f.role == "copy"
-                else "—"
-                for f in report.files
-            ]
-            ssim = [
-                "качество ≥0.95"
-                if f.role == "original"
-                else str(report.deep.get("ssim_vs_original_mean", "—"))
-                if f.role == "copy"
-                else "—"
-                for f in report.files
-            ]
-            rows.append(("aHash Hamming", ham))
+            per = {
+                int(row.get("index") or 0): row
+                for row in (report.deep.get("per_copy") or [])
+                if isinstance(row, dict)
+            }
+
+            def _cell(role: str, index: int, key: str, origin_label: str) -> str:
+                if role == "original":
+                    return origin_label
+                if role == "copy" and index in per:
+                    val = per[index].get(key, "—")
+                    return str(val)
+                return "—"
+
+            ham = [_cell(f.role, f.index, "hamming_vs_original", "16×16") for f in report.files]
+            pair = [_cell(f.role, f.index, "hamming_vs_copies_mean", "между копиями") for f in report.files]
+            ssim = [_cell(f.role, f.index, "ssim_vs_original", "≥0.95") for f in report.files]
+            rows.append(("aHash vs оригинал", ham))
+            rows.append(("aHash между копиями", pair))
             rows.append(("SSIM", ssim))
         self.table.setRowCount(len(rows))
         for r, (label, values) in enumerate(rows):

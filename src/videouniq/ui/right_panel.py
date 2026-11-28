@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -155,6 +156,7 @@ class RightPanel(QFrame):
     output_changed = Signal(str)
     save_preset_requested = Signal()
     zip_requested = Signal()
+    size_mode_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -249,6 +251,19 @@ class RightPanel(QFrame):
         note.setWordWrap(True)
         note.setStyleSheet("color: #9CA3AF; font-size: 11px;")
         layout.addWidget(note)
+
+        layout.addWidget(self._label("Контроль веса файла"))
+        self.size_combo = QComboBox()
+        self.size_combo.addItem("Максимальное качество (CRF 17 / CQ 19)", "quality")
+        self.size_combo.addItem("Умный битрейт (Не раздувать вес)", "smart")
+        self.size_combo.currentIndexChanged.connect(lambda _: self.size_mode_changed.emit())
+        layout.addWidget(self.size_combo)
+        size_hint = QLabel(
+            "Умный битрейт: −maxrate 115–130% от оригинала, без квадратов. Звук AAC 320 кбит/с."
+        )
+        size_hint.setWordWrap(True)
+        size_hint.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+        layout.addWidget(size_hint)
 
         master_row = QHBoxLayout()
         master_lab = QLabel("Чистый мастер проекта")
@@ -380,6 +395,15 @@ class RightPanel(QFrame):
 
     def save_master(self) -> bool:
         return bool(self.master_toggle.isChecked())
+
+    def size_mode(self) -> str:
+        return str(self.size_combo.currentData() or "quality")
+
+    def set_size_mode(self, key: str) -> None:
+        for i in range(self.size_combo.count()):
+            if self.size_combo.itemData(i) == key:
+                self.size_combo.setCurrentIndex(i)
+                return
 
     def output_dir(self) -> str:
         return self.out_edit.text().strip()

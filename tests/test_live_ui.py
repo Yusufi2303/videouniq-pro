@@ -321,6 +321,11 @@ def main() -> int:
     check(card is not None and card.report_btn.isVisible(), "Отчёт уникальности on card")
     loaded = load_report(done[0].output_dir) if done and done[0].output_dir else None
     check(loaded is not None and loaded.verdict in {"unique", "warn"}, loaded.verdict if loaded else None)
+    check(loaded is not None and loaded.copies and "." in loaded.copies[0].duration_label, loaded.copies[0].duration_label if loaded and loaded.copies else None)
+    check(win.right.size_combo.count() == 2, win.right.size_combo.count())
+    check(win.right.size_mode() == "quality", win.right.size_mode())
+    check("Не раздувать" in win.right.size_combo.itemText(1), win.right.size_combo.itemText(1))
+    check(win.render_page.size_combo.count() == 2, "render size modes")
     check(loaded is not None and len(loaded.copies[0].md5) == 32, "real md5 in uniqueness.json")
     check(loaded is not None and "00000000" not in loaded.copies[0].md5, loaded.copies[0].md5 if loaded else "")
     dlg = UniquenessDialog(done[0].path, done[0].output_dir, win)

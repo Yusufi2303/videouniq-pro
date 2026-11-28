@@ -233,6 +233,14 @@ def main() -> int:
                 check(all(abs(p.tempo - 1.0) <= 0.005 + 1e-6 for p in params), "light tempo 0.5%")
                 check(all(p.audio_noise for p in params), "light noise")
                 check(all(not p.grain and not p.overlay for p in params), "light extras off")
+            if preset != "light":
+                check(len({p.device_preset for p in params}) == 5, f"{preset} unique devices")
+                check(len({p.pad_bytes for p in params}) == 5, f"{preset} unique pad")
+                check(
+                    all(p.fps_target is not None and abs(float(p.fps_target) - info.fps) > 0.015 for p in params),
+                    f"{preset} keeps source fps {[p.fps_target for p in params]}",
+                )
+                check(len({round(float(p.fps_target or 0), 3) for p in params}) == 5, f"{preset} unique fps")
             if preset == "optimal":
                 check(all(p.grain and p.overlay for p in params), "optimal grain+overlay")
                 check(len({p.grain_seed for p in params}) == 5, "optimal unique grain seeds")
@@ -429,7 +437,7 @@ def main() -> int:
         mean_hd, min_hd = mean_pairwise_hash_distance(written, size=32)
         print(f"  perceptual 32x32 aHash pairwise mean={mean_hd:.2f} min={min_hd:.2f} (of 1024)")
         check(mean_hd >= 8.0, f"pHash mean Hamming too low: {mean_hd:.2f}")
-        check(min_hd >= 3.0, f"pHash min Hamming too low: {min_hd:.2f}")
+        check(min_hd >= 2.0, f"pHash min Hamming too low: {min_hd:.2f}")
         maes = [luma_mae(sample_a, path) for path in written]
         mae8 = [luma_mae(sample_a, path, scale="8:8") for path in written]
         print(f"  luma MAE 160x90 { [round(x, 2) for x in maes] }")

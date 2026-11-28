@@ -317,6 +317,13 @@ def main() -> int:
         check(loaded.text_clips[0].text == "Боевой тест", "vup roundtrip")
         media = probe_media(speech)
         copies = generate_unique_set(media, 5, "optimal")
+        check(len({p.device_preset for p in copies}) == 5, "unique devices in batch")
+        check(len({p.pad_bytes for p in copies}) == 5, "unique pad bytes")
+        check(
+            all(p.fps_target and abs(p.fps_target - media.fps) > 0.015 for p in copies),
+            [p.fps_target for p in copies],
+        )
+        check(len({round(float(p.fps_target or 0), 3) for p in copies}) == 5, "unique fps")
         check(len({p.gop_size for p in copies}) >= 2, "GOP varies")
         check(any(abs(p.hue_deg) > 0.01 for p in copies), "hue field present")
         check(any(p.eq_notch_hz for p in copies), "notch EQ")
