@@ -12,7 +12,8 @@ PROXY_MAX_EDGE = 1080
 
 
 def is_heavy_source(width: int, height: int) -> bool:
-    return int(width) > 1920 or int(height) > 1080
+    """Proxy only above 1080p. 1080×1920 (9:16 phone) is not heavy."""
+    return max(int(width), int(height)) > 1920
 
 
 def proxy_cache_path(src: str | Path) -> Path:
@@ -59,8 +60,10 @@ def ensure_proxy(src: str | Path, width: int = 0, height: int = 0, timeout: floa
         "-loglevel",
         "error",
         "-y",
-        "-hwaccel",
-        "auto",
+        "-fflags",
+        "+genpts+igndts+discardcorrupt",
+        "-ignore_editlist",
+        "1",
         "-i",
         str(src),
         "-an",

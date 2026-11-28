@@ -195,6 +195,7 @@ def build_edit_and_uniquize(
             if clip.has_audio:
                 parts.append(
                     f"[{idx}:a]atrim=start={start:.4f}:end={end:.4f},asetpts=PTS-STARTPTS,"
+                    f"aresample=48000:async=1:first_pts=0,"
                     f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
                     f"volume={vol:.4f}[a{i}]"
                 )

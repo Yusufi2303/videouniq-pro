@@ -250,7 +250,7 @@ class InspectorPanel(QWidget):
             clip.transition_duration = self.tdur.value()
             clip.clamped()
         elif isinstance(clip, TextClip):
-            clip.text = self.text_edit.text() or "Текст"
+            clip.text = self.text_edit.text()
             clip.font_family = self.font.currentFont().family()
             clip.font_size = self.size.value()
             clip.stroke_enabled = self.stroke.isChecked()

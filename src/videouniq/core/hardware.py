@@ -150,6 +150,13 @@ def is_gpu_encode_error(message: str) -> bool:
         "yuv422",
         "gbrp",
         "p010",
+        "non-monotonic",
+        "monotonically",
+        "error muxing",
+        "conversion failed",
+        "invalid argument",
+        "invalid data found",
+        "dts",
     )
     return any(k in s for k in keys)
 

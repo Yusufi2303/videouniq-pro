@@ -101,7 +101,7 @@ def test_zip_contains_python_runtime_and_src_on_pth() -> None:
         assert req in names, f"zip missing {req}"
     assert "../src" in pth.replace("\\", "/")
     assert "sys.path.insert" in boot
-    assert '__version__ = "2.1.2"' in init
+    assert '__version__ = "2.1.3"' in init
     assert pyw.file_size > 50_000
     assert pye.file_size > 50_000
     assert exe.file_size > 20_000

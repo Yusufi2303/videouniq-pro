@@ -7,8 +7,10 @@ PresetName = Literal["light", "optimal", "hard", "manual"]
 
 DEVICE_PRESETS = (
     "iphone_13",
+    "iphone_13_pro_max",
     "iphone_14",
     "iphone_15",
+    "iphone_15_pro_max",
     "iphone_16",
     "samsung_s23",
     "samsung_s24",

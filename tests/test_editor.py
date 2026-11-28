@@ -36,6 +36,7 @@ from videouniq.editor.ops import (
     clip_at_time,
     close_gaps,
     delete_clip,
+    join_clip_with_next,
     packed_starts,
     reorder_clip,
     split_clip,
@@ -198,6 +199,21 @@ def t_trim_split_magnetic() -> None:
     c2 = VideoClip(in_point=0, out_point=1, source_duration=1)
     p2 = EditorProject(video_clips=[c1, c2])
     check(abs(packed_starts(p2.video_clips)[1] - 1.0) < 1e-6, "abut")
+    src = VideoClip(source_path="/tmp/long.mp4", in_point=0, out_point=8.0, source_duration=8.0)
+    ps = EditorProject(video_clips=[src])
+    right = split_clip(ps, 3.0)
+    check(right is not None and len(ps.video_clips) == 2, "split two pieces")
+    check(ps.video_clips[0].clip_id != ps.video_clips[1].clip_id, "split unique ids")
+    left_id, right_id = ps.video_clips[0].clip_id, ps.video_clips[1].clip_id
+    check(reorder_clip(ps, right_id, 0), "reorder split")
+    check(ps.video_clips[0].clip_id == right_id, "split piece dragged to front")
+    check(delete_clip(ps, right_id), "delete one split piece")
+    check(len(ps.video_clips) == 1 and ps.video_clips[0].clip_id == left_id, "other piece remains")
+    extra = VideoClip(source_path="/tmp/b.mp4", in_point=0, out_point=2.0, source_duration=2.0)
+    ps.video_clips.append(extra)
+    check(len(ps.video_clips) == 2, "append imported clip")
+    check(join_clip_with_next(ps, ps.video_clips[0].clip_id), "glue appended")
+    check(ps.video_clips[0].transition == "none", "glue concat")
     p2.video_clips[0].transition = "crossfade"
     p2.video_clips[0].transition_duration = 0.4
     starts = packed_starts(p2.video_clips)
@@ -310,6 +326,7 @@ def t_text_png_and_safe_zone(tmp: Path) -> None:
     check("[v420]" in g2 and vmap == "[v420]", vmap)
     check("format=yuv420p[v420]" in g2, "forced yuv420p before encode")
     check(is_heavy_source(3840, 2160) and not is_heavy_source(1920, 1080), "4K is heavy")
+    check(not is_heavy_source(1080, 1920), "9:16 1080p is not heavy")
     edge = TextClip(text="Низ", x_norm=0.5, y_norm=0.97, font_size=40, plate=True)
     jx2, jy2 = clamp_text_shift(edge, 1080, 1920, 12, 15)
     x0, y0, x1, y1 = measure_text(edge, 1080, 1920, jx2, jy2).aabb
@@ -367,6 +384,34 @@ def t_ui_surfaces() -> None:
     app.processEvents()
     check(win.sidebar._page == "editor", win.sidebar._page)
     check(win.editor._auto.interval() == 60_000, "autosave 60s")
+    check(win.editor.delete_btn.text() == "Удалить", "delete button")
+    check(win.editor.join_btn.text() == "Склеить", "join button")
+    long_clip = VideoClip(source_path="01.mp4", in_point=0, out_point=158.0, source_duration=158.0)
+    win.editor.project.video_clips = [long_clip]
+    win.editor.timeline.set_project(win.editor.project)
+    win.editor.timeline.resize(900, 180)
+    check(win.editor.timeline.max_scroll() > 100, f"scroll range {win.editor.timeline.max_scroll()}")
+    win.editor.timeline.set_playhead(150.0)
+    phx = win.editor.timeline._x(150.0)
+    check(0 < phx < win.editor.timeline.width() + 40, f"playhead on screen {phx}")
+    from videouniq.core.metadata import DEVICE_LABELS, metadata_pairs
+    from videouniq.core.params import DEVICE_PRESETS, UniqueParams
+
+    check("iphone_13_pro_max" in DEVICE_PRESETS and "iphone_15_pro_max" in DEVICE_PRESETS, DEVICE_PRESETS)
+    labels = [DEVICE_LABELS[k] for k in DEVICE_PRESETS if k.startswith("iphone")]
+    check(labels[:6] == ["iPhone 13", "iPhone 13 Pro Max", "iPhone 14", "iPhone 15", "iPhone 15 Pro Max", "iPhone 16"], labels[:6])
+    p13 = UniqueParams(device_preset="iphone_13_pro_max", metadata_token="abc123")
+    tags13 = dict(metadata_pairs(p13))
+    check(tags13.get("make") == "Apple", tags13)
+    check(tags13.get("model") == "iPhone 13 Pro Max", tags13)
+    check(tags13.get("software") == "17.6.1", tags13)
+    check(tags13.get("com.apple.quicktime.software") == "17.6.1", tags13)
+    check("iPhone14,3" in (tags13.get("encoder") or ""), tags13.get("encoder"))
+    p15 = UniqueParams(device_preset="iphone_15_pro_max", metadata_token="abc123")
+    tags15 = dict(metadata_pairs(p15))
+    check(tags15.get("model") == "iPhone 15 Pro Max", tags15)
+    check(tags15.get("software") == "18.2.1", tags15)
+    check("iPhone16,2" in (tags15.get("encoder") or ""), tags15.get("encoder"))
     win.sidebar.set_page("history")
     app.processEvents()
     check(win.stack.currentIndex() == 2, "history page index")

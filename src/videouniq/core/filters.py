@@ -119,11 +119,15 @@ def video_uniquize_filters(media: MediaInfo, params: UniqueParams) -> tuple[list
             f"noise=alls={strength}:allf=t:all_seed={seed}:c0_seed={c0}:c1_seed={c1}:c2_seed={c2}"
         )
 
-    if params.fps_target and params.fps_target > 1:
-        v.append(f"fps={params.fps_target:.4f}")
+    rate = params.fps_target if params.fps_target and params.fps_target > 1 else 0.0
+    if rate <= 1:
+        rate = media.fps if 5.0 < float(media.fps or 0) <= 60.5 else 30.0
+    v.append(f"fps={rate:.4f}")
 
     if abs(params.tempo - 1.0) > 1e-4:
         v.append(f"setpts=PTS/{params.tempo:.5f}")
+    else:
+        v.append("setpts=PTS-STARTPTS")
 
     v.append("format=yuv420p")
     return v, end
@@ -138,11 +142,12 @@ def audio_uniquize_filters(media: MediaInfo, params: UniqueParams, end: float | 
             a.append(f"atrim=start={max(0.0, params.trim_start):.4f}")
         a.append("asetpts=PTS-STARTPTS")
 
+    a.append("aresample=48000:async=1:first_pts=0")
     rate = 48000
     pitch_ratio = 2 ** (params.pitch_semitones / 12.0) if abs(params.pitch_semitones) > 1e-6 else 1.0
     if abs(pitch_ratio - 1.0) > 1e-6:
         a.append(f"asetrate={rate}*{pitch_ratio:.8f}")
-        a.append(f"aresample={rate}")
+        a.append(f"aresample={rate}:async=1")
     atempo = params.tempo / pitch_ratio
     if abs(atempo - 1.0) > 1e-4:
         a.append(f"atempo={atempo:.5f}")
@@ -166,6 +171,7 @@ def audio_uniquize_filters(media: MediaInfo, params: UniqueParams, end: float | 
         else:
             left, right = priming, priming + stereo
         a.append(f"adelay={left:.2f}|{right:.2f}:all=1")
+    a.append("asetpts=PTS-STARTPTS")
     return a
 
 

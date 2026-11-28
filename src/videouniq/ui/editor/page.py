@@ -52,17 +52,31 @@ class EditorPage(QWidget):
         self.open_btn = QPushButton("Открыть")
         self.save_btn = QPushButton("Сохранить")
         self.save_as_btn = QPushButton("Сохранить как")
-        self.split_btn = QPushButton("Разрезать (Ctrl+B)")
+        self.split_btn = QPushButton("Разрезать")
+        self.split_btn.setToolTip("Разрезать клип по красной метке (Ctrl+B)")
+        self.delete_btn = QPushButton("Удалить")
+        self.join_btn = QPushButton("Склеить")
         self.export_btn = QPushButton("Экспорт")
         self.send_btn = QPushButton("В уникализатор (5)")
         self.send_btn.setObjectName("CtaButton")
         self.zip_btn = QPushButton("ZIP копий")
-        for b in (self.open_btn, self.save_btn, self.save_as_btn, self.split_btn, self.export_btn, self.zip_btn):
+        for b in (
+            self.open_btn,
+            self.save_btn,
+            self.save_as_btn,
+            self.split_btn,
+            self.delete_btn,
+            self.join_btn,
+            self.export_btn,
+            self.zip_btn,
+        ):
             b.setObjectName("GhostButton")
         self.open_btn.clicked.connect(self.open_project_dialog)
         self.save_btn.clicked.connect(lambda: self.save_project(False))
         self.save_as_btn.clicked.connect(lambda: self.save_project(True))
         self.split_btn.clicked.connect(self.split_at_playhead)
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.join_btn.clicked.connect(self._join_selected)
         self.export_btn.clicked.connect(lambda: self.export_clean.emit(self.project))
         self.send_btn.clicked.connect(self._send)
         self.zip_btn.clicked.connect(self.zip_requested.emit)
@@ -71,6 +85,8 @@ class EditorPage(QWidget):
             self.save_btn,
             self.save_as_btn,
             self.split_btn,
+            self.delete_btn,
+            self.join_btn,
             self.export_btn,
             self.send_btn,
             self.zip_btn,
@@ -103,11 +119,12 @@ class EditorPage(QWidget):
         self.bin.add_text_requested.connect(self.add_text)
         self.player.playhead_changed.connect(self._on_playhead)
         self.player.selection_changed.connect(lambda i: self._select("text", i))
-        self.player.project_changed.connect(self._touch)
+        self.player.project_changed.connect(lambda: self._touch(rebind=False))
         self.timeline.playhead_changed.connect(self.player.set_playhead)
         self.timeline.selection_changed.connect(self._select)
-        self.timeline.project_changed.connect(self._touch)
-        self.inspector.changed.connect(self._touch)
+        self.timeline.project_changed.connect(lambda: self._touch(rebind=False))
+        self.timeline.files_dropped.connect(self._append_files)
+        self.inspector.changed.connect(lambda: self._touch(rebind=False))
 
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self.split_at_playhead)
         QShortcut(QKeySequence("Ctrl+S"), self, activated=lambda: self.save_project(False))
@@ -115,7 +132,15 @@ class EditorPage(QWidget):
         QShortcut(QKeySequence("Space"), self, activated=self.player.toggle)
         QShortcut(QKeySequence("Left"), self, activated=lambda: self.player.step(-1))
         QShortcut(QKeySequence("Right"), self, activated=lambda: self.player.step(1))
-        QShortcut(QKeySequence("Delete"), self, activated=self._delete_selected)
+        for seq in ("Delete", "Backspace"):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(self._delete_selected)
+
+        self._text_guard = QTimer(self)
+        self._text_guard.setSingleShot(True)
+        self._text_guard.setInterval(350)
+        self._pending_text: TextClip | None = None
 
         self._auto = QTimer(self)
         self._auto.setInterval(60_000)
@@ -181,10 +206,14 @@ class EditorPage(QWidget):
 
     def import_media(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Видео", str(Path.home()), "Видео (*.mp4 *.mov *.avi *.mkv *.webm);;Все файлы (*)"
+            self, "Добавить видео на дорожку", str(Path.home()), "Видео (*.mp4 *.mov *.avi *.mkv *.webm);;Все файлы (*)"
         )
+        self._append_files(files)
+
+    def _append_files(self, files: list[str]) -> None:
         for f in files:
-            self.add_media(f)
+            if f:
+                self.add_media(f)
 
     def add_media(self, path: str) -> None:
         try:
@@ -206,10 +235,22 @@ class EditorPage(QWidget):
         self.project.video_clips.append(clip.clamped())
         close_gaps(self.project)
         self.project.sync_canvas()
+        self._select("video", clip.clip_id)
         self._touch()
-        self.log_line.emit(f"Клип: {info.name}")
+        self.log_line.emit(f"Клип в конец дорожки: {info.name}")
 
     def add_text(self, clip: TextClip) -> None:
+        self._pending_text = clip
+        if self._text_guard.isActive():
+            return
+        self._text_guard.start()
+        self._commit_text()
+
+    def _commit_text(self) -> None:
+        clip = self._pending_text
+        self._pending_text = None
+        if clip is None:
+            return
         clip.start = self.player.playhead
         if not clip.duration:
             clip.duration = 3.0
@@ -220,18 +261,45 @@ class EditorPage(QWidget):
     def split_at_playhead(self) -> None:
         right = split_clip(self.project, self.player.playhead)
         if right is None:
+            QMessageBox.information(self, "Разрезать", "Поставьте красную метку внутрь клипа и нажмите «Разрезать».")
             return
+        self._select("video", right.clip_id)
         self._touch()
-        self.log_line.emit("Клип разрезан")
+        self.log_line.emit("Клип разрезан — куски можно перетащить и удалить по одному")
 
     def _delete_selected(self) -> None:
+        from PySide6.QtWidgets import QLineEdit
+
         from videouniq.editor.ops import delete_clip
 
+        focus = self.focusWidget()
+        if isinstance(focus, QLineEdit) and self.timeline.selected[0] == "text":
+            return
         kind, cid = self.timeline.selected
         if not cid:
             cid = self.player.canvas.selected_id
-        if cid and delete_clip(self.project, cid):
+            kind = "text" if cid else kind
+        if not cid:
+            return
+        if delete_clip(self.project, cid):
+            self.timeline.selected = ("", "")
+            self.player.canvas.selected_id = ""
+            self.inspector.show_clip("", "")
             self._touch()
+            self.log_line.emit("Клип удалён")
+
+    def _join_selected(self) -> None:
+        from videouniq.editor.ops import join_clip_with_next
+
+        kind, cid = self.timeline.selected
+        if kind != "video" or not cid:
+            if self.project.video_clips:
+                cid = self.project.video_clips[0].clip_id
+            else:
+                return
+        if join_clip_with_next(self.project, cid):
+            self._touch()
+            self.log_line.emit("Клипы склеены")
 
     def _select(self, kind: str, clip_id: str) -> None:
         self.timeline.selected = (kind, clip_id)
@@ -239,14 +307,22 @@ class EditorPage(QWidget):
         self.inspector.show_clip(kind, clip_id)
         self.timeline.update()
         self.player.canvas.update()
+        if kind == "video" and clip_id:
+            self.timeline.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_playhead(self, t: float) -> None:
         self.timeline.set_playhead(t)
 
-    def _touch(self) -> None:
+    def _touch(self, rebind: bool = True) -> None:
         self.dirty = True
         close_gaps(self.project)
-        self.bind()
+        if rebind:
+            self.bind()
+        else:
+            name = self.project.name or "Без названия"
+            self.title.setText(name + " •")
+            self.timeline.update()
+            self.player.canvas.update()
         self.dirty_changed.emit(True)
 
     def _send(self) -> None:
@@ -260,6 +336,10 @@ class EditorPage(QWidget):
         self.send_to_uniquizer.emit(self.project)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._delete_selected()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Space:
             self.player.toggle()
             event.accept()

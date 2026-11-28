@@ -208,6 +208,18 @@ def main() -> int:
         check(max(pinfo.width, pinfo.height) <= 1080, f"proxy {pinfo.width}x{pinfo.height}")
         check(min(pinfo.width, pinfo.height) <= 1080, f"proxy short {pinfo.width}x{pinfo.height}")
 
+        print("9:16 phone encode (DTS sanitize)")
+        phone = make_clip(tmp / "phone.mp4", 1.4, "1080x1920", rate=25)
+        pinfo = probe_media(phone)
+        check((pinfo.width, pinfo.height) == (1080, 1920), (pinfo.width, pinfo.height))
+        check(not is_heavy_source(pinfo.width, pinfo.height), "1080x1920 not heavy")
+        pparams = generate_unique_set(pinfo, 1, "hard")[0]
+        pdest = tmp / "phone_out.mp4"
+        encode_copy(pinfo, pparams, pdest, encoder, x264_threads=2)
+        check(pdest.is_file() and pdest.stat().st_size > 1000, pdest)
+        pout = probe_media(pdest)
+        check(pout.width == 1080 and pout.height == 1920, (pout.width, pout.height))
+
         print("speech-like A/V + 5 Optimal + master")
         speech = make_clip(tmp / "speech.mp4", 8.0, "1280x720", rate=30, freq=180)
         proj = project_for(speech)

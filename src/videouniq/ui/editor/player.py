@@ -69,21 +69,25 @@ def grab_frame(
     src: str,
     seconds: float,
     size: tuple[int, int],
-    hwaccel: bool = True,
+    hwaccel: bool = False,
 ) -> QPixmap | None:
     if not src or not Path(src).is_file():
         return None
     w, h = size
 
-    def _once(use_hw: bool) -> QPixmap | None:
+    def _once(use_hw: bool, codec: str, seek_after: bool) -> QPixmap | None:
         cmd = [ffmpeg_bin(), "-hide_banner", "-loglevel", "error"]
+        cmd += ["-fflags", "+genpts+igndts+discardcorrupt", "-ignore_editlist", "1"]
         if use_hw:
             cmd += ["-hwaccel", "auto"]
+        ts = f"{max(0.0, seconds):.4f}"
+        if not seek_after:
+            cmd += ["-ss", ts]
+        cmd += ["-i", src]
+        if seek_after:
+            cmd += ["-ss", ts]
+        fmt = "png" if codec == "png" else "mjpeg"
         cmd += [
-            "-ss",
-            f"{max(0.0, seconds):.4f}",
-            "-i",
-            src,
             "-frames:v",
             "1",
             "-vf",
@@ -91,21 +95,26 @@ def grab_frame(
             "-f",
             "image2pipe",
             "-vcodec",
-            "mjpeg",
+            codec,
             "pipe:1",
         ]
         proc = subprocess.run(cmd, capture_output=True, timeout=12, check=False)
         if proc.returncode != 0 or not proc.stdout:
             return None
-        img = QImage.fromData(proc.stdout, "JPG")
+        img = QImage.fromData(proc.stdout, "PNG" if fmt == "png" else "JPG")
         if img.isNull():
             return None
         return QPixmap.fromImage(img)
 
-    pix = _once(hwaccel)
-    if pix is None and hwaccel:
-        pix = _once(False)
-    return pix
+    for use_hw, codec, seek_after in (
+        (False, "png", True),
+        (False, "mjpeg", True),
+        (hwaccel, "mjpeg", False),
+    ):
+        pix = _once(use_hw, codec, seek_after)
+        if pix is not None:
+            return pix
+    return None
 
 
 class CanvasWidget(QWidget):
@@ -117,6 +126,7 @@ class CanvasWidget(QWidget):
         self.setObjectName("CanvasHost")
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.frame = QPixmap()

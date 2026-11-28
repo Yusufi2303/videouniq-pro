@@ -83,6 +83,35 @@ def _parse_fps(rate: str) -> float:
         return 0.0
 
 
+def _sane_fps(avg: float, raw: float) -> float:
+    """Phone MP4s often report avg_frame_rate like 100/1 or 90k/900. Keep 1–60."""
+    candidates = [x for x in (avg, raw) if x and 1.0 < x <= 60.5]
+    if candidates:
+        if avg in candidates:
+            return avg
+        return candidates[0]
+    if raw > 60.5 and 1.0 < raw / 2 <= 60.5:
+        return raw / 2
+    return 30.0
+
+
+def _rotation_deg(video: dict) -> float:
+    tags = video.get("tags") or {}
+    try:
+        rot = float(tags.get("rotate") or 0)
+    except (TypeError, ValueError):
+        rot = 0.0
+    for item in video.get("side_data_list") or []:
+        if not isinstance(item, dict):
+            continue
+        if "rotation" in item:
+            try:
+                rot = float(item.get("rotation") or rot)
+            except (TypeError, ValueError):
+                continue
+    return rot
+
+
 def _color(value: str, fallback: str) -> str:
     if not value or value in {"unknown", "unspecified", "N/A"}:
         return fallback
@@ -135,9 +164,14 @@ def probe_media(path: str | Path, timeout: float = 30.0) -> MediaInfo:
     except OSError:
         size_bytes = int(fmt.get("size") or 0)
 
-    fps = _parse_fps(video.get("avg_frame_rate") or "") or _parse_fps(video.get("r_frame_rate") or "")
+    avg = _parse_fps(video.get("avg_frame_rate") or "")
+    raw = _parse_fps(video.get("r_frame_rate") or "")
+    fps = _sane_fps(avg, raw)
     width = int(video.get("width") or 0)
     height = int(video.get("height") or 0)
+    rot = _rotation_deg(video)
+    if abs(rot) % 180.0 >= 45.0:
+        width, height = height, width
     if width <= 0 or height <= 0:
         raise RuntimeError("Не удалось определить разрешение")
 

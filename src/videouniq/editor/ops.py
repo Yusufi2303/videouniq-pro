@@ -100,6 +100,31 @@ def reorder_clip(project: EditorProject, clip_id: str, new_index: int) -> bool:
     return True
 
 
+def join_clip_with_next(project: EditorProject, clip_id: str) -> bool:
+    """Glue two adjacent clips: merge a same-source split pair, else concat with no transition."""
+    clips = project.video_clips
+    idx = next((i for i, c in enumerate(clips) if c.clip_id == clip_id), -1)
+    if idx < 0 or len(clips) < 2:
+        return False
+    if idx >= len(clips) - 1:
+        idx -= 1
+    left, right = clips[idx], clips[idx + 1]
+    same = left.source_path == right.source_path and left.source_path
+    abut = abs(left.out_point - right.in_point) < 0.04
+    if same and abut:
+        left.out_point = max(left.out_point, right.out_point)
+        left.transition = right.transition
+        left.transition_duration = right.transition_duration
+        left.clamped()
+        clips.pop(idx + 1)
+        close_gaps(project)
+        return True
+    left.transition = "none"
+    left.clamped()
+    close_gaps(project)
+    return True
+
+
 def delete_clip(project: EditorProject, clip_id: str) -> bool:
     before = len(project.video_clips)
     project.video_clips = [c for c in project.video_clips if c.clip_id != clip_id]

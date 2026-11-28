@@ -100,6 +100,40 @@ def _seconds_from_ts(value: str) -> float:
         return 0.0
 
 
+def demux_sanitize_args() -> list[str]:
+    """Rebuild timestamps from phone MP4s (VFR, edit lists, non-monotonic DTS)."""
+    return [
+        "-fflags",
+        "+genpts+igndts+discardcorrupt",
+        "-ignore_editlist",
+        "1",
+        "-avoid_negative_ts",
+        "make_zero",
+    ]
+
+
+def wrap_input_files(paths: list[str]) -> list[str]:
+    args: list[str] = []
+    video_ext = {".mp4", ".mov", ".m4v", ".qt"}
+    for src in paths:
+        ext = Path(src).suffix.lower()
+        if ext in video_ext:
+            args += demux_sanitize_args()
+        args += ["-i", src]
+    return args
+
+
+def mux_sanitize_args() -> list[str]:
+    return [
+        "-fps_mode",
+        "cfr",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-max_muxing_queue_size",
+        "9999",
+    ]
+
+
 def container_output_args(params: UniqueParams, encoder_kind: str) -> list[str]:
     """Per-copy GOP, keyframe offset, timescale, and mux priming — hash-visible, eye-invisible."""
     args: list[str] = []
@@ -163,9 +197,7 @@ def encode_copy(
     spec: GraphSpec | None = graph_spec if isinstance(graph_spec, GraphSpec) else None
     if spec is not None:
         graph = spec.graph
-        input_args: list[str] = []
-        for src in spec.inputs:
-            input_args += ["-i", src]
+        input_args = wrap_input_files(list(spec.inputs))
         has_audio = spec.has_audio
         color_media = spec.as_media(media.path)
         expected = max(0.2, spec.duration)
@@ -173,7 +205,7 @@ def encode_copy(
             expected = expected / params.tempo + max(0.0, params.aac_priming_ms) / 1000.0
     else:
         graph = build_filter_complex(media, params)
-        input_args = ["-i", media.path]
+        input_args = wrap_input_files([media.path])
         has_audio = media.has_audio
         color_media = media
         expected = max(0.2, output_duration(media, params))
@@ -215,6 +247,7 @@ def encode_copy(
             *_color_args(color_media),
             *audio_args,
             *ffmpeg_metadata_args(params),
+            *mux_sanitize_args(),
             "-movflags",
             "+faststart+use_metadata_tags",
             "-progress",

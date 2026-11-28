@@ -311,6 +311,25 @@ def main() -> int:
         check("apple" in (tags.get("make") or "").lower() or "iphone" in json.dumps(tags).lower(), tags)
         graph = build_filter_complex(info, params, None)
         check("crop=" in graph or "trim=" in graph, graph)
+        for preset, model, software, hw in (
+            ("iphone_13_pro_max", "iPhone 13 Pro Max", "17.6.1", "iPhone14,3"),
+            ("iphone_15_pro_max", "iPhone 15 Pro Max", "18.2.1", "iPhone16,2"),
+        ):
+            p = generate_unique_set(info, 1, "light")[0]
+            p.device_preset = preset
+            p.write_metadata = True
+            pairs = dict(metadata_pairs(p))
+            check(pairs.get("make") == "Apple", pairs)
+            check(pairs.get("model") == model, pairs)
+            check(pairs.get("software") == software, pairs)
+            check(pairs.get("com.apple.quicktime.model") == model, pairs)
+            check(pairs.get("com.apple.quicktime.software") == software, pairs)
+            check(hw in (pairs.get("encoder") or ""), pairs.get("encoder"))
+            out = tmp / "meta" / f"{preset}.mp4"
+            encode_copy(info, p, out, encoder, x264_threads=2)
+            written = {k.lower(): v for k, v in ffprobe_format(out)["format"]["tags"].items()}
+            blob = json.dumps(written).lower()
+            check("apple" in blob and "iphone" in blob, written)
 
     def t_all_presets_encode() -> None:
         info = probe_media(sample_a)
