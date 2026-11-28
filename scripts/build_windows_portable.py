@@ -62,9 +62,10 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "scripts" / "VideoUniqPro.bat", dest / "VideoUniqPro.bat")
     exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro 2.1.0 — портативная сборка для Windows 10/11 x64.\r\n"
-        "1. Распакуйте папку на рабочий стол.\r\n"
-        "2. Запустите VideoUniqPro.exe (без чёрной консоли).\r\n"
+        "VideoUniq Pro 2.1.1 — портативная сборка для Windows 10/11 x64.\r\n"
+        "1. Распакуйте ВСЮ папку на рабочий стол (python, src, vendor рядом с .exe).\r\n"
+        "2. Запустите VideoUniqPro.exe из этой папки (без чёрной консоли).\r\n"
+        "   Не копируйте только .exe — Python ищется рядом с ним, не из другой папки.\r\n"
         "   Запасной запуск: VideoUniqPro.bat\r\n"
         "FFmpeg и Python уже внутри. Интернет не нужен.\r\n",
         encoding="utf-8",
@@ -112,10 +113,40 @@ def compile_windows_exe(bundle: Path) -> Path | None:
         print("launcher link", proc.stderr or proc.stdout)
         return None
     dest = bundle / "VideoUniqPro.exe"
-    shutil.copy2(work / "VideoUniqPro.exe", dest)
+    built = work / "VideoUniqPro.exe"
+    if dest.resolve() != built.resolve():
+        shutil.copy2(built, dest)
     magic = dest.read_bytes()[:2]
     print("exe", dest, dest.stat().st_size, "MZ" if magic == b"MZ" else magic)
     return dest
+
+
+def ensure_pythonw(python_dir: Path) -> None:
+    """Embeddable CPython usually ships pythonw.exe; copy python.exe if not."""
+    pye = python_dir / "python.exe"
+    pyw = python_dir / "pythonw.exe"
+    if not pye.is_file():
+        raise RuntimeError(f"python.exe missing in {python_dir}")
+    if not pyw.is_file():
+        shutil.copy2(pye, pyw)
+        print("copied python.exe -> pythonw.exe")
+    print("python embed", pye.name, pye.stat().st_size, pyw.name, pyw.stat().st_size)
+
+
+def verify_zip(dest_zip: Path) -> None:
+    required = {
+        "VideoUniqPro/VideoUniqPro.exe",
+        "VideoUniqPro/python/pythonw.exe",
+        "VideoUniqPro/python/python.exe",
+        "VideoUniqPro/VideoUniqPro.bat",
+        "VideoUniqPro/src/videouniq/__init__.py",
+    }
+    with zipfile.ZipFile(dest_zip) as zf:
+        names = set(zf.namelist())
+    missing = sorted(r for r in required if r not in names)
+    if missing:
+        raise RuntimeError("zip missing " + ", ".join(missing))
+    print("zip verified", dest_zip)
 
 
 def patch_pth(python_dir: Path) -> None:
@@ -274,29 +305,37 @@ def zip_bundle(bundle: Path, dest_zip: Path) -> Path:
 
 def main() -> int:
     bundle = WORK / APP_NAME
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    bundle.mkdir(parents=True)
-    cache = ROOT / "build" / "cache"
-    cache.mkdir(parents=True, exist_ok=True)
-
-    py_zip = download(PY_URL, cache / f"python-{PY_VER}-embed-amd64.zip")
-    shared = cache / "ffmpeg-win64-gpl-shared.zip"
-    if shared.is_file() and shared.stat().st_size > 1_000_000:
-        ff_zip = shared
+    update_only = "--update" in sys.argv and (bundle / "python" / "python.exe").is_file()
+    if update_only:
+        print("update existing bundle", bundle)
+        ensure_pythonw(bundle / "python")
+        copy_app(bundle)
     else:
-        ff_zip = download(FFMPEG_URL, cache / "ffmpeg-release-essentials.zip")
+        if WORK.exists():
+            shutil.rmtree(WORK)
+        bundle.mkdir(parents=True)
+        cache = ROOT / "build" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
 
-    python_dir = bundle / "python"
-    unzip(py_zip, python_dir)
-    patch_pth(python_dir)
-    install_wheels(python_dir, cache / "wheels-win")
-    place_ffmpeg(bundle, ff_zip)
-    copy_app(bundle)
-    slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        py_zip = download(PY_URL, cache / f"python-{PY_VER}-embed-amd64.zip")
+        shared = cache / "ffmpeg-win64-gpl-shared.zip"
+        if shared.is_file() and shared.stat().st_size > 1_000_000:
+            ff_zip = shared
+        else:
+            ff_zip = download(FFMPEG_URL, cache / "ffmpeg-release-essentials.zip")
+
+        python_dir = bundle / "python"
+        unzip(py_zip, python_dir)
+        ensure_pythonw(python_dir)
+        patch_pth(python_dir)
+        install_wheels(python_dir, cache / "wheels-win")
+        place_ffmpeg(bundle, ff_zip)
+        copy_app(bundle)
+        slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
 
     dest = DIST / ZIP_NAME
     zip_bundle(bundle, dest)
+    verify_zip(dest)
     print("OK", dest)
     return 0
 

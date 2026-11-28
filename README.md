@@ -2,7 +2,7 @@
 
 Пакетная уникализация видео без нейросетей и визуальный редактор (CapCut-стиль). Windows 10/11 x64 (портативная папка с `.exe`) и Linux для разработки.
 
-Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (libmpv по возможности, иначе Qt Multimedia / кадры FFmpeg). Версия: **2.1.0**.
+Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (libmpv по возможности, иначе Qt Multimedia / кадры FFmpeg). Версия: **2.1.1**.
 
 ## Запуск на Linux (демо / разработка)
 
@@ -25,7 +25,7 @@ PYTHONPATH=src python -m videouniq
 
 ## Windows
 
-Распакуйте zip на рабочий стол и запустите **`VideoUniqPro.exe`** (иконка, без чёрной консоли). Запасной запуск: `VideoUniqPro.bat`. Внутри уже лежат Python, PySide6 и FFmpeg.
+Распакуйте **всю** папку на рабочий стол и запустите **`VideoUniqPro.exe`** из неё (иконка, без чёрной консоли). Рядом должны остаться `python`, `src`, `vendor`. Не копируйте один `.exe` в другое место. Запасной запуск: `VideoUniqPro.bat`. Внутри уже лежат Python, PySide6 и FFmpeg.
 
 ## Сборка Windows zip с Linux
 
