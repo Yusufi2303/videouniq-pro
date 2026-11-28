@@ -24,6 +24,7 @@ from videouniq.core.pipeline import (
     encode_copy,
     extract_preview,
     file_md5,
+    finalize_filter_graph,
     uniquize_source,
 )
 from videouniq.core.probe import collect_videos, probe_media
@@ -368,6 +369,24 @@ def main() -> int:
         cpu = detect_hardware("cpu")
         check(cpu.kind == "cpu" and cpu.video_codec == "libx264", cpu)
         check(auto.video_codec in {"libx264", "h264_nvenc", "h264_qsv", "h264_amf"}, auto)
+        graph, vmap = finalize_filter_graph("[0:v]eq=contrast=1.01,crop=64:64:0:0[vout]")
+        check("format=yuv420p[v420]" in graph, graph)
+        check(vmap == "[v420]", vmap)
+        info = probe_media(sample_a)
+        params = generate_unique_set(info, 1, "optimal")[0]
+        if abs(params.hue_deg) < 0.02:
+            params.hue_deg = 0.7
+        if not params.eq_notch_hz:
+            params.eq_notch_hz = 720.0
+            params.eq_notch_gain = -0.8
+        if params.stereo_delay_ms < 0.5:
+            params.stereo_delay_ms = 1.6
+        args = container_output_args(params, "nvenc")
+        check("-g" in args, "GOP passed to GPU encoder")
+        uni = build_filter_complex(info, params)
+        check("hue=h=" in uni, "hue uniquize intact")
+        check("adelay=" in uni, "stereo delay intact")
+        check("equalizer=" in uni, "notch EQ intact")
 
     def t_perceptual_and_quality() -> None:
         info = probe_media(sample_a)

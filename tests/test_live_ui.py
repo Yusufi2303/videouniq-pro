@@ -54,6 +54,9 @@ def shot(win: MainWindow, name: str) -> Path:
         import shutil
 
         shutil.copy2(dest, STORE_SHOT / name)
+        v21 = name if name.startswith("v2.1-") else f"v2.1-{name}"
+        shutil.copy2(dest, STORE_SHOT / v21)
+        shutil.copy2(dest, SHOT / v21)
     except Exception:
         pass
     return dest
@@ -253,6 +256,11 @@ def main() -> int:
     win.editor.player.aspect.setCurrentIndex(idx)
     pump(80)
     check(win.editor.project.aspect == "16:9", win.editor.project.aspect)
+    win.editor.player._set_loading(True)
+    pump(40)
+    shot(win, "v2.1-playhead-loading.png")
+    win.editor.player._set_loading(False)
+    shot(win, "v2.1-player.png")
 
     # Save .vup by clicking Сохранить (path preset)
     win.editor.project.path = str(vup)
@@ -325,12 +333,16 @@ def main() -> int:
     shot(win, "live_09b_history.png")
     click(win.sidebar._buttons["render"])
     pump(80)
+    check("Размер кэша" in win.render_page.cache_size_lab.text(), win.render_page.cache_size_lab.text())
+    check("Очистить кэш сейчас" in win.render_page.cache_btn.text(), win.render_page.cache_btn.text())
+    shot(win, "v2.1-settings-cache.png")
     click(win.render_page.cache_btn)
     pump(80)
     logs = win.logs_page.view.toPlainText()
     check("Кэш очищен" in logs, "cache clear log")
 
     shot(win, "live_10_settings_cache.png")
+    shot(win, "v2.1-player-proxy-label.png")
     win.close()
     pump(50)
 

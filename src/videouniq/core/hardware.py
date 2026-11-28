@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +57,19 @@ def _probe_nvenc_name() -> str:
         return ""
 
 
+def _win_dll(name: str) -> bool:
+    if sys.platform != "win32":
+        return False
+    roots = [os.environ.get("SystemRoot", r"C:\Windows"), r"C:\Windows"]
+    for root in roots:
+        for sub in ("System32", "SysWOW64"):
+            if Path(root, sub, name).is_file():
+                return True
+    return False
+
+
 def _can_encode(codec: str, extra: list[str]) -> bool:
+    """CPU filters (crop/noise/eq) → format=yuv420p → GPU/CPU encoder."""
     with tempfile.TemporaryDirectory(prefix="vu-enc-") as tmp:
         out = Path(tmp) / "t.mp4"
         cmd = [
@@ -66,9 +80,13 @@ def _can_encode(codec: str, extra: list[str]) -> bool:
             "-f",
             "lavfi",
             "-i",
-            "color=c=black:s=64x64:d=0.04:r=25",
+            "color=c=black:s=128x128:d=0.08:r=25",
+            "-filter_complex",
+            "crop=120:120:4:4,eq=contrast=1.01,noise=alls=1:allf=t,format=yuv420p[vout]",
+            "-map",
+            "[vout]",
             "-frames:v",
-            "1",
+            "2",
             "-c:v",
             codec,
             *extra,
@@ -79,7 +97,7 @@ def _can_encode(codec: str, extra: list[str]) -> bool:
             str(out),
         ]
         try:
-            proc = _run(cmd, timeout=12)
+            proc = _run(cmd, timeout=16)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
         return proc.returncode == 0 and out.is_file() and out.stat().st_size > 0
@@ -87,12 +105,63 @@ def _can_encode(codec: str, extra: list[str]) -> bool:
 
 def _gpu_present(kind: str) -> bool:
     if kind == "nvenc":
-        return bool(_probe_nvenc_name() or Path("/dev/nvidia0").exists())
+        return bool(
+            _probe_nvenc_name()
+            or Path("/dev/nvidia0").exists()
+            or _win_dll("nvEncodeAPI64.dll")
+            or _win_dll("nvcuda.dll")
+        )
     if kind == "qsv":
-        return Path("/dev/dri/renderD128").exists() or Path("/dev/dri/card0").exists()
+        return (
+            Path("/dev/dri/renderD128").exists()
+            or Path("/dev/dri/card0").exists()
+            or _win_dll("libmfx64-gen.dll")
+            or _win_dll("libmfxhw64.dll")
+            or _win_dll("igfx11cmrt64.dll")
+        )
     if kind == "amf":
-        return Path("/dev/dri/renderD128").exists() or Path("/dev/kfd").exists()
+        return (
+            Path("/dev/dri/renderD128").exists()
+            or Path("/dev/kfd").exists()
+            or _win_dll("amfrt64.dll")
+            or _win_dll("amfrt32.dll")
+        )
     return False
+
+
+def is_gpu_encode_error(message: str) -> bool:
+    s = (message or "").lower()
+    keys = (
+        "nvenc",
+        "qsv",
+        "amf",
+        "pix_fmt",
+        "pixel format",
+        "not supported",
+        "no capable",
+        "openencodesession",
+        "mfx",
+        "cuda",
+        "dx11",
+        "cannot load nvencodeapi",
+        "does not support",
+        "invalid pix_fmt",
+        "yuv444",
+        "yuv422",
+        "gbrp",
+        "p010",
+    )
+    return any(k in s for k in keys)
+
+
+def cpu_encoder() -> EncoderChoice:
+    return EncoderChoice(
+        kind="cpu",
+        video_codec="libx264",
+        extra=["-preset", "slow", "-crf", "17"],
+        label="CPU · libx264 CRF 17",
+        gpu_name="",
+    )
 
 
 def detect_hardware(preference: str = "auto") -> EncoderChoice:
@@ -144,12 +213,15 @@ def detect_hardware(preference: str = "auto") -> EncoderChoice:
     if preference in {"nvenc", "qsv", "amf"}:
         for item in candidates:
             if item.kind == preference:
-                if _gpu_present(item.kind) and _can_encode(item.video_codec, item.extra):
+                if _can_encode(item.video_codec, item.extra):
                     return item
         return cpu
 
     for item in candidates:
-        if _gpu_present(item.kind) and _can_encode(item.video_codec, item.extra):
+        # Skip encode probe when the GPU is clearly absent (avoids 16s timeouts on CI).
+        if not _gpu_present(item.kind):
+            continue
+        if _can_encode(item.video_codec, item.extra):
             return item
     return cpu
 

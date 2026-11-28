@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Assemble a portable Windows x64 folder: embeddable CPython + wheels + FFmpeg + app.
 
-Rebuild after the V2 visual editor add-on so the zip matches src/videouniq.
-The previous shipped artifact is v2.0.0; next zip is v2.0.1.
+Rebuild after V2.1 so the zip matches src/videouniq.
+Ships VideoUniqPro.exe (GUI, no console) plus VideoUniqPro.bat fallback.
 """
 
 from __future__ import annotations
@@ -60,13 +60,62 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "requirements.txt", dest / "requirements.txt")
     shutil.copy2(ROOT / "README.md", dest / "README.md")
     shutil.copy2(ROOT / "scripts" / "VideoUniqPro.bat", dest / "VideoUniqPro.bat")
+    exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro — портативная сборка для Windows 10/11 x64.\r\n"
+        "VideoUniq Pro 2.1.0 — портативная сборка для Windows 10/11 x64.\r\n"
         "1. Распакуйте папку на рабочий стол.\r\n"
-        "2. Запустите VideoUniqPro.bat\r\n"
+        "2. Запустите VideoUniqPro.exe (без чёрной консоли).\r\n"
+        "   Запасной запуск: VideoUniqPro.bat\r\n"
         "FFmpeg и Python уже внутри. Интернет не нужен.\r\n",
         encoding="utf-8",
     )
+    if exe is None:
+        print("WARNING: VideoUniqPro.exe not built (mingw missing)")
+
+
+def compile_windows_exe(bundle: Path) -> Path | None:
+    """Cross-compile a GUI-subsystem PE launcher with icon (no console)."""
+    gcc = shutil.which("x86_64-w64-mingw32-gcc")
+    windres = shutil.which("x86_64-w64-mingw32-windres")
+    if not gcc:
+        return None
+    icon = ROOT / "src" / "videouniq" / "resources" / "app.ico"
+    if not icon.is_file():
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "make_app_icon.py")], check=False)
+    work = ROOT / "build" / "win-launcher"
+    work.mkdir(parents=True, exist_ok=True)
+    obj = work / "launcher.o"
+    res_obj = work / "app.res"
+    src = ROOT / "scripts" / "windows_launcher.c"
+    cmd = [gcc, "-c", "-O2", str(src), "-o", str(obj)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print("launcher cc", proc.stderr or proc.stdout)
+        return None
+    link = [gcc, "-mwindows", "-O2", str(obj)]
+    if windres and icon.is_file():
+        rc = work / "app.rc"
+        rc.write_text(f'IDI_ICON1 ICON "{icon.as_posix()}"\n', encoding="utf-8")
+        rproc = subprocess.run(
+            [windres, "-O", "coff", "-i", str(rc), "-o", str(res_obj)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rproc.returncode == 0:
+            link.append(str(res_obj))
+        else:
+            print("windres", rproc.stderr or rproc.stdout)
+    link += ["-o", str(work / "VideoUniqPro.exe")]
+    proc = subprocess.run(link, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        print("launcher link", proc.stderr or proc.stdout)
+        return None
+    dest = bundle / "VideoUniqPro.exe"
+    shutil.copy2(work / "VideoUniqPro.exe", dest)
+    magic = dest.read_bytes()[:2]
+    print("exe", dest, dest.stat().st_size, "MZ" if magic == b"MZ" else magic)
+    return dest
 
 
 def patch_pth(python_dir: Path) -> None:

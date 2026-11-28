@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from videouniq.core.hardware import ENCODER_LABELS
+from videouniq.editor.export import cache_size_label
 from videouniq.ui.widgets.toggle import ToggleSwitch
 
 
@@ -102,15 +103,22 @@ class RenderSettingsPage(QWidget):
         layout.addWidget(note)
 
         layout.addWidget(self._cap("Кэш"))
+        self.cache_size_lab = QLabel(cache_size_label())
+        self.cache_size_lab.setObjectName("CacheSizeLabel")
+        self.cache_size_lab.setStyleSheet("color: #E5E7EB; font-size: 13px;")
+        layout.addWidget(self.cache_size_lab)
         cache_row = QHBoxLayout()
-        self.cache_btn = QPushButton("Очистить кэш превью и временных файлов")
+        self.cache_btn = QPushButton("Очистить кэш сейчас")
         self.cache_btn.setObjectName("GhostButton")
         self.cache_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cache_btn.clicked.connect(self.cache_clear_requested.emit)
         cache_row.addWidget(self.cache_btn)
         cache_row.addStretch(1)
         layout.addLayout(cache_row)
-        cache_hint = QLabel("Удаляет кадры превью и кэш FFmpeg. Проекты .vup не трогает.")
+        cache_hint = QLabel(
+            "Папка кэша: %LOCALAPPDATA%\\VideoUniqPro\\cache (прокси плеера, PNG текста, превью). "
+            "При выходе временные файлы удаляются, последний автосейв .vup сохраняется, если проект не сохранён вручную."
+        )
         cache_hint.setWordWrap(True)
         cache_hint.setStyleSheet("color: #9CA3AF; font-size: 12px;")
         layout.addWidget(cache_hint)
@@ -129,3 +137,6 @@ class RenderSettingsPage(QWidget):
 
     def set_hardware_info(self, text: str) -> None:
         self.hw_info.setText(text)
+
+    def refresh_cache_size(self) -> None:
+        self.cache_size_lab.setText(cache_size_label())
