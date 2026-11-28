@@ -11,6 +11,59 @@ from videouniq.paths import cache_dir, ffmpeg_bin
 PROXY_MAX_EDGE = 1080
 
 
+def playback_copy_path(src: str | Path) -> Path:
+    p = Path(src)
+    try:
+        stamp = int(p.stat().st_mtime)
+        size = int(p.stat().st_size)
+    except OSError:
+        stamp, size = 0, 0
+    key = hashlib.sha1(f"{p.resolve()}|{stamp}|{size}|copy".encode()).hexdigest()[:20]
+    return cache_dir() / "play" / f"{key}.mp4"
+
+
+def ensure_stream_copy(src: str | Path, timeout: float = 90.0) -> str:
+    """Remux with -c copy (same pixels/audio) so Qt can play phone MP4s. Not a proxy."""
+    src = Path(src)
+    if not src.is_file():
+        return str(src)
+    dest = playback_copy_path(src)
+    if dest.is_file() and dest.stat().st_size > 1000:
+        try:
+            if dest.stat().st_mtime >= src.stat().st_mtime:
+                return str(dest)
+        except OSError:
+            return str(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-ignore_editlist",
+        "1",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+    if proc.returncode == 0 and dest.is_file() and dest.stat().st_size > 1000:
+        return str(dest)
+    dest.unlink(missing_ok=True)
+    return str(src)
+
+
 def is_heavy_source(width: int, height: int) -> bool:
     """Proxy only above 1080p. 1080×1920 (9:16 phone) is not heavy."""
     return max(int(width), int(height)) > 1920

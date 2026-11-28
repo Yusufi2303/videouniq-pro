@@ -211,7 +211,7 @@ class UniqueParams:
 @dataclass
 class RenderSettings:
     encoder: str = "auto"  # auto | cpu | nvenc | qsv | amf
-    threads: int = 2
+    threads: int = 1
     crf: int = 17
     nvenc_cq: int = 19
     nvenc_preset: str = "p6"

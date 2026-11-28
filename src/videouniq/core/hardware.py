@@ -161,6 +161,20 @@ def is_gpu_encode_error(message: str) -> bool:
     return any(k in s for k in keys)
 
 
+def ram_gb() -> float:
+    try:
+        import psutil
+
+        return float(psutil.virtual_memory().total) / (1024**3)
+    except Exception:
+        return 8.0
+
+
+def recommended_encode_workers() -> int:
+    """1 worker on 8 GB-class machines; 2 when there is enough RAM."""
+    return 1 if ram_gb() <= 12.0 else 2
+
+
 def cpu_encoder() -> EncoderChoice:
     return EncoderChoice(
         kind="cpu",

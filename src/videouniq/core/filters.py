@@ -202,11 +202,11 @@ def uniquize_labeled(
             params.overlay_seed or 1,
             params.overlay_strength or 8,
             opacity=0.012 if params.overlay_strength >= 14 else 0.01,
-            duration=max(1.0, output_duration(media, params) + 0.5),
+            duration=max(1.0, output_duration(media, params) + 2.0),
         )
         parts.append(f"{vin}{video_chain}[vbase]")
         parts.append(f"{ov}[ov]")
-        parts.append(f"[vbase][ov]overlay=0:0:format=yuv420:shortest=1,format=yuv420p[{vout}]")
+        parts.append(f"[vbase][ov]overlay=0:0:format=yuv420,format=yuv420p[{vout}]")
     else:
         parts.append(f"{vin}{video_chain}[{vout}]")
 
@@ -217,7 +217,7 @@ def uniquize_labeled(
         ain = _label(a_in or "0:a")
         aout_name = a_out.strip("[]")
         if params.audio_noise:
-            duration = max(0.25, output_duration(media, params) + 1.0)
+            duration = max(0.25, output_duration(media, params) + 0.15)
             color = "pink" if params.noise_color == "pink" else "white"
             seed = max(1, int(params.noise_seed) & 0x7FFFFFFF)
             parts.append(f"{ain}{audio_chain}[a1]")
@@ -228,7 +228,7 @@ def uniquize_labeled(
                 "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[ano]"
             )
             parts.append(
-                f"[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,"
+                f"[a1][ano]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
                 f"volume=1,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{aout_name}]"
             )
         else:

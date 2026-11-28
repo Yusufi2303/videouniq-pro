@@ -186,8 +186,24 @@ def encode_stderr_failed(stderr: str) -> bool:
         "error opening",
         "non-monotonic dts",
         "922337203685477",
+        "cannot allocate memory",
+        "out of memory",
+        "not enough memory",
     )
     return any(k in s for k in keys)
+
+
+def is_oom_error(message: str) -> bool:
+    s = (message or "").lower()
+    return any(
+        k in s
+        for k in (
+            "cannot allocate memory",
+            "out of memory",
+            "not enough memory",
+            "std::bad_alloc",
+        )
+    )
 
 
 def mux_sanitize_args() -> list[str]:
@@ -199,7 +215,7 @@ def mux_sanitize_args() -> list[str]:
         "-max_interleave_delta",
         "0",
         "-max_muxing_queue_size",
-        "9999",
+        "1024",
         "-shortest",
     ]
 
@@ -303,6 +319,10 @@ def encode_copy(
             "-hide_banner",
             "-y",
             "-nostdin",
+            "-filter_threads",
+            "1",
+            "-filter_complex_threads",
+            "1",
             *input_args,
             "-filter_complex",
             graph,

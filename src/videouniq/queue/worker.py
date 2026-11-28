@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 
@@ -9,8 +11,7 @@ from PySide6.QtCore import QObject, Signal
 
 from videouniq.core.hardware import EncoderChoice
 from videouniq.core.params import UniqueParams
-from videouniq.core.pipeline import JobCancelled, encode_copy, file_md5
-from videouniq.core.probe import MediaInfo
+from videouniq.core.pipeline import JobCancelled, encode_copy, file_md5, is_oom_error
 from videouniq.editor.filtergraph import build_edit_and_uniquize
 from videouniq.editor.project import EditorProject
 from videouniq.queue.models import CopyJob, FileItem
@@ -35,6 +36,11 @@ class RenderController(QObject):
         self._pending: dict[str, int] = {}
         self._failed: dict[str, int] = {}
         self._running = False
+        self._queue: deque[CopyJob] = deque()
+        self._in_flight = 0
+        self._workers_n = 1
+        self._encoder: EncoderChoice | None = None
+        self._x264_threads = 0
 
     @property
     def running(self) -> bool:
@@ -108,12 +114,16 @@ class RenderController(QObject):
 
         self._stop.clear()
         self._running = True
+        self._queue = deque(jobs)
+        self._in_flight = 0
+        self._workers_n = workers
+        self._encoder = encoder
+        self._x264_threads = x264_threads
+        self._futures = []
         self.running_changed.emit(True)
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vu-enc")
-        self._futures = [
-            self._pool.submit(self._run_job, job, encoder, x264_threads) for job in jobs
-        ]
+        self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="vu-enc")
         self.log_line.emit(f"Старт: {len(jobs)} копий, потоков {workers}, энкодер {encoder.label}")
+        self._kick()
         threading.Thread(target=self._wait_done, daemon=True).start()
         return len(jobs)
 
@@ -123,12 +133,35 @@ class RenderController(QObject):
         self._stop.set()
         self.log_line.emit("Остановка…")
 
+    def _kick(self) -> None:
+        if self._pool is None or self._encoder is None:
+            return
+        submitted: list[CopyJob] = []
+        with self._lock:
+            while (
+                self._in_flight < self._workers_n
+                and self._queue
+                and not self._stop.is_set()
+            ):
+                job = self._queue.popleft()
+                self._in_flight += 1
+                submitted.append(job)
+        for job in submitted:
+            fut = self._pool.submit(self._run_job, job, self._encoder, self._x264_threads)
+            with self._lock:
+                self._futures.append(fut)
+
     def _wait_done(self) -> None:
-        for fut in list(self._futures):
-            try:
-                fut.result()
-            except Exception as exc:  # noqa: BLE001
-                self.log_line.emit(f"Ошибка потока: {exc}")
+        while True:
+            if self._stop.is_set():
+                with self._lock:
+                    if self._in_flight <= 0:
+                        break
+            else:
+                with self._lock:
+                    if self._in_flight <= 0 and not self._queue:
+                        break
+            time.sleep(0.08)
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
@@ -138,6 +171,14 @@ class RenderController(QObject):
         self.all_finished.emit(cancelled)
 
     def _run_job(self, job: CopyJob, encoder: EncoderChoice, x264_threads: int) -> None:
+        try:
+            self._encode_one(job, encoder, x264_threads)
+        finally:
+            with self._lock:
+                self._in_flight = max(0, self._in_flight - 1)
+            self._kick()
+
+    def _encode_one(self, job: CopyJob, encoder: EncoderChoice, x264_threads: int) -> None:
         if self._stop.is_set():
             self.job_failed.emit(job.item_id, job.copy_index, "Остановлено")
             self._mark_item(job.item_id)
@@ -199,6 +240,17 @@ class RenderController(QObject):
                 last_error = str(exc)
                 self.log_line.emit(f"Сбой {Path(job.dest).name}: {last_error}")
                 Path(job.dest).unlink(missing_ok=True)
+                if is_oom_error(last_error) and job.oom_tries < 2:
+                    job.oom_tries += 1
+                    with self._lock:
+                        self._workers_n = 1
+                        self._x264_threads = max(1, (os.cpu_count() or 4))
+                        self._queue.appendleft(job)
+                    self.log_line.emit(
+                        f"Мало RAM (Cannot allocate memory) — повтор {Path(job.dest).name} "
+                        f"по одной копии ({job.oom_tries}/2)"
+                    )
+                    return
                 params.pad_bytes += 17
         self.job_failed.emit(job.item_id, job.copy_index, last_error or "ошибка")
         self._mark_item(job.item_id)

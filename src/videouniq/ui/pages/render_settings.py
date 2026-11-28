@@ -51,6 +51,7 @@ class RenderSettingsPage(QWidget):
         col1 = QVBoxLayout()
         col1.addWidget(self._cap("Потоки"))
         self.threads = QComboBox()
+        self.threads.addItem("1 поток", 1)
         self.threads.addItem("2 потока", 2)
         self.threads.addItem("4 потока", 4)
         self.threads.currentIndexChanged.connect(lambda _: self.changed.emit())

@@ -270,6 +270,16 @@ def main() -> int:
         check("async=1" not in graph and "first_pts=0" not in graph, "no async aresample")
         check("asetpts=PTS-STARTPTS" in graph, "PTS reset")
         check("adelay=" in graph and "hue=h=" in graph and "anoisesrc=" in graph, "hard modules")
+        check(":d=" in graph, "overlay duration capped")
+        from videouniq.core.hardware import recommended_encode_workers
+        from videouniq.core.pipeline import is_oom_error
+        from videouniq.editor.proxy import ensure_stream_copy
+
+        check(recommended_encode_workers() in (1, 2), recommended_encode_workers())
+        check(is_oom_error("Error while filtering: Cannot allocate memory"), "oom detect")
+        copied = Path(ensure_stream_copy(phone))
+        cinfo = probe_media(copied)
+        check((cinfo.width, cinfo.height) == (1080, 1920), "stream copy stays native")
         fast = EncoderChoice(
             kind="cpu",
             video_codec="libx264",

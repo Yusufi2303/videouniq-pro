@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from videouniq import __app_name__, __version__
-from videouniq.core.hardware import detect_hardware, encoder_with_quality
+from videouniq.core.hardware import detect_hardware, ram_gb, recommended_encode_workers, encoder_with_quality
 from videouniq.core.params import ManualRanges, ModuleFlags, UniqueParams, flags_for_preset, ranges_for_preset
 from videouniq.core.pipeline import encode_copy, extract_preview, preview_cache_path
 from videouniq.core.probe import collect_videos, probe_media
@@ -209,10 +209,24 @@ class MainWindow(QMainWindow):
         self.sidebar.set_hardware(f"GPU: {gpu}\n{choice.label}")
         self.render_page.set_hardware_info(text)
         self.logs_page.append(f"Аппаратный энкодер: {choice.label}")
+        self.logs_page.append(
+            f"RAM {ram_gb():.0f} ГБ · потоков уникализации: {self.render_page.thread_count()} "
+            f"(рекомендуется {recommended_encode_workers()})"
+        )
 
     def _restore(self) -> None:
-        threads = int(self.settings.value("threads", 2))
-        idx = 0 if threads != 4 else 1
+        rec = recommended_encode_workers()
+        raw = self.settings.value("threads", rec)
+        try:
+            threads = int(raw)
+        except (TypeError, ValueError):
+            threads = rec
+        # Old default was 2; on 8 GB-class that OOMs Hard 1080×1920.
+        if threads == 2 and rec == 1:
+            threads = 1
+        if threads not in (1, 2, 4):
+            threads = rec
+        idx = {1: 0, 2: 1, 4: 2}.get(threads, 0)
         self.render_page.threads.setCurrentIndex(idx)
         enc = str(self.settings.value("encoder", "auto"))
         for i in range(self.render_page.encoder.count()):
