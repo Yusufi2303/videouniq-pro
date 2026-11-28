@@ -27,10 +27,10 @@ def temporal_overlay_chain(
     strength = max(1, min(40, int(strength)))
     seed = max(1, int(seed) & 0x7FFFFFFF)
     alpha = max(0.004, min(0.03, float(opacity)))
-    dur = max(1.0, float(duration))
+    del duration  # infinite overlay; main video is shortest
     c0, c1, c2 = seed, (seed + 17) & 0x7FFFFFFF, (seed + 31) & 0x7FFFFFFF
     return (
-        f"color=c=0x808080:s={w}x{h}:r={rate:.4f}:d={dur:.3f},"
+        f"color=c=0x808080:s={w}x{h}:r={rate:.4f},"
         f"format=yuv420p,"
         f"noise=alls={strength}:allf=t:all_seed={seed}:c0_seed={c0}:c1_seed={c1}:c2_seed={c2},"
         f"format=yuva420p,"

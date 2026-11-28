@@ -44,6 +44,7 @@ def test_boot_script_adds_src_and_catches_import() -> None:
     assert "videouniq.app" in text
     assert "MessageBoxW" in text
     assert "LOCALAPPDATA" in text
+    assert "QT_MEDIA_BACKEND" in text
 
 
 def test_pth_patch_includes_src() -> None:
@@ -90,6 +91,9 @@ def test_zip_contains_python_runtime_and_src_on_pth() -> None:
         qwin = zf.getinfo(
             "VideoUniqPro/python/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll"
         )
+        mm_pyd = zf.getinfo(
+            "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimedia.pyd"
+        )
     for req in (
         "VideoUniqPro/VideoUniqPro.exe",
         "VideoUniqPro/boot.py",
@@ -97,16 +101,23 @@ def test_zip_contains_python_runtime_and_src_on_pth() -> None:
         "VideoUniqPro/python/python.exe",
         "VideoUniqPro/python/Lib/site-packages/sitecustomize.py",
         "VideoUniqPro/src/videouniq/__main__.py",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimedia.pyd",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimediaWidgets.pyd",
     ):
         assert req in names, f"zip missing {req}"
+    assert any("ffmpegmediaplugin" in n.lower() for n in names), "zip missing ffmpegmediaplugin"
     assert "../src" in pth.replace("\\", "/")
     assert "sys.path.insert" in boot
-    assert '__version__ = "2.1.3"' in init
+    assert "QT_MEDIA_BACKEND" in boot
+    assert '__version__ = "2.1.4"' in init
     assert pyw.file_size > 50_000
     assert pye.file_size > 50_000
     assert exe.file_size > 20_000
     assert qwin.file_size > 50_000
-    print(f"zip pythonw={pyw.file_size} python={pye.file_size} launcher={exe.file_size} qwindows={qwin.file_size}")
+    print(
+        f"zip pythonw={pyw.file_size} python={pye.file_size} launcher={exe.file_size} "
+        f"qwindows={qwin.file_size} qtmm={mm_pyd.file_size}"
+    )
 
 
 def _which(name: str) -> str | None:

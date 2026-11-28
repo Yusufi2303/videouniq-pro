@@ -63,7 +63,7 @@ def copy_app(dest: Path) -> None:
     shutil.copy2(ROOT / "scripts" / "windows_boot.py", dest / "boot.py")
     exe = compile_windows_exe(dest)
     (dest / "ЧИТАЙ.txt").write_text(
-        "VideoUniq Pro 2.1.3 — портативная сборка для Windows 10/11 x64.\r\n"
+        "VideoUniq Pro 2.1.4 — портативная сборка для Windows 10/11 x64.\r\n"
         "1. Распакуйте ВСЮ папку на рабочий стол (python, src, vendor рядом с .exe).\r\n"
         "2. Запустите VideoUniqPro.exe из этой папки (без чёрной консоли).\r\n"
         "   Не копируйте только .exe — Python ищется рядом с ним, не из другой папки.\r\n"
@@ -147,6 +147,8 @@ def verify_zip(dest_zip: Path) -> None:
         "VideoUniqPro/src/videouniq/__init__.py",
         "VideoUniqPro/python/Lib/site-packages/sitecustomize.py",
         "VideoUniqPro/python/Lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimedia.pyd",
+        "VideoUniqPro/python/Lib/site-packages/PySide6/QtMultimediaWidgets.pyd",
     }
     with zipfile.ZipFile(dest_zip) as zf:
         names = set(zf.namelist())
@@ -156,7 +158,10 @@ def verify_zip(dest_zip: Path) -> None:
         raise RuntimeError("zip missing " + ", ".join(missing))
     if "../src" not in pth.replace("\\", "/"):
         raise RuntimeError("python312._pth must include ../src (embed ignores PYTHONPATH)")
-    print("zip verified", dest_zip)
+    mm = [n for n in names if "ffmpegmediaplugin" in n.lower() or n.endswith("QtMultimedia.pyd")]
+    if not any("ffmpegmediaplugin" in n.lower() for n in names):
+        raise RuntimeError("zip missing Qt FFmpeg multimedia plugin (player would be stills)")
+    print("zip verified", dest_zip, "multimedia", mm[:4])
 
 
 def patch_pth(python_dir: Path) -> None:
@@ -230,6 +235,7 @@ def install_wheels(python_dir: Path, wheel_dir: Path) -> None:
         "pip",
         "download",
         "PySide6_Essentials==6.12.0",
+        "PySide6_Addons==6.12.0",
         "shiboken6==6.12.0",
         "psutil==7.2.2",
         "--python-version",
@@ -314,6 +320,60 @@ def slim_pyside(pyside: Path) -> None:
         "translations/*.qm",
         "qml/**",
         "metatypes/**",
+        "Qt6WebEngine*.dll",
+        "Qt6WebChannel*.dll",
+        "Qt6WebView*.dll",
+        "Qt6WebSockets*.dll",
+        "Qt6Pdf*.dll",
+        "Qt6Charts*.dll",
+        "Qt6DataVisualization*.dll",
+        "Qt6Graphs*.dll",
+        "Qt63D*.dll",
+        "Qt6Bluetooth*.dll",
+        "Qt6Nfc*.dll",
+        "Qt6Positioning*.dll",
+        "Qt6Location*.dll",
+        "Qt6Sensors*.dll",
+        "Qt6Serial*.dll",
+        "Qt6RemoteObjects*.dll",
+        "Qt6TextToSpeech*.dll",
+        "Qt6HttpServer*.dll",
+        "Qt6StateMachine*.dll",
+        "Qt6Scxml*.dll",
+        "Qt6Quick3D*.dll",
+        "QtWebEngine*.pyd",
+        "QtWebChannel*.pyd",
+        "QtWebView*.pyd",
+        "QtWebSockets*.pyd",
+        "QtPdf*.pyd",
+        "QtCharts*.pyd",
+        "QtDataVisualization*.pyd",
+        "QtGraphs*.pyd",
+        "Qt3D*.pyd",
+        "QtBluetooth*.pyd",
+        "QtNfc*.pyd",
+        "QtPositioning*.pyd",
+        "QtLocation*.pyd",
+        "QtSensors*.pyd",
+        "QtSerial*.pyd",
+        "QtRemoteObjects*.pyd",
+        "QtTextToSpeech*.pyd",
+        "QtHttpServer*.pyd",
+        "QtStateMachine*.pyd",
+        "QtScxml*.pyd",
+        "QtQuick3D*.pyd",
+        "plugins/geoservices/*",
+        "plugins/sensors/*",
+        "plugins/position/*",
+        "plugins/canbus/*",
+        "plugins/renderers/*",
+        "plugins/sceneparsers/*",
+        "plugins/geometryloaders/*",
+        "plugins/webview/*",
+        "plugins/scxmldatamodel/*",
+        "plugins/texttospeech/*",
+        "Qt/qml/**",
+        "Qt/resources/qtwebengine*",
     ]
     removed = 0
     for pattern in drop_globs:
@@ -327,6 +387,23 @@ def slim_pyside(pyside: Path) -> None:
     print(f"slimmed PySide6 by {removed/1e6:.1f} MB")
     _upx_dir(pyside)
     _upx_dir(pyside / "plugins")
+    ensure_multimedia_plugins(pyside)
+
+
+def ensure_multimedia_plugins(pyside: Path) -> None:
+    """Qt looks at plugins/multimedia; Addons sometimes extract under Qt/plugins."""
+    dest = pyside / "plugins" / "multimedia"
+    dest.mkdir(parents=True, exist_ok=True)
+    for src in (pyside / "plugins" / "multimedia", pyside / "Qt" / "plugins" / "multimedia"):
+        if not src.is_dir():
+            continue
+        for item in src.iterdir():
+            if item.is_file():
+                target = dest / item.name
+                if item.resolve() != target.resolve():
+                    shutil.copy2(item, target)
+    if not any(dest.glob("*ffmpegmediaplugin*")):
+        print("WARNING: ffmpegmediaplugin missing after extract")
 
 
 def _upx_dir(folder: Path) -> None:
@@ -368,6 +445,13 @@ def main() -> int:
     if update_only:
         print("update existing bundle", bundle)
         ensure_pythonw(bundle / "python")
+        mm = bundle / "python" / "Lib" / "site-packages" / "PySide6" / "QtMultimedia.pyd"
+        if not mm.is_file():
+            print("QtMultimedia missing — installing Addons wheels")
+            install_wheels(bundle / "python", ROOT / "build" / "cache" / "wheels-win")
+            slim_pyside(bundle / "python" / "Lib" / "site-packages" / "PySide6")
+        else:
+            ensure_multimedia_plugins(bundle / "python" / "Lib" / "site-packages" / "PySide6")
         finalize_python_runtime(bundle / "python")
         copy_app(bundle)
     else:

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from videouniq.core.hardware import detect_hardware
+from videouniq.core.hardware import EncoderChoice, detect_hardware
 from videouniq.core.params import UniqueParams
 from videouniq.core.pipeline import encode_copy, file_md5
 from videouniq.core.probe import probe_media
@@ -38,6 +38,55 @@ def check(cond: bool, msg: str) -> None:
 
 def run(cmd, **kw):
     return subprocess.run(cmd, text=True, capture_output=True, check=False, **kw)
+
+
+def make_phone_clip(path: Path, seconds: float, size: str = "1080x1920", rate: int = 25) -> Path:
+    """Vertical phone MP4: 90 kHz timescale, 80 ms A/V delay, 44.1 kHz AAC."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    src = "testsrc2" if seconds <= 8 else "color=c=0x1a334d"
+    video = (
+        f"{src}=size={size}:rate={rate}:duration={seconds}"
+        if src == "testsrc2"
+        else f"{src}:s={size}:r={rate}:d={seconds}"
+    )
+    cmd = [
+        ffmpeg_bin(),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        video,
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=180:sample_rate=44100:duration={seconds}",
+        "-filter_complex",
+        "[0:v]setpts=PTS+0.08/TB[v];[1:a]adelay=80|80[a]",
+        "-map",
+        "[v]",
+        "-map",
+        "[a]",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-video_track_timescale",
+        "90000",
+        "-c:a",
+        "aac",
+        "-ar",
+        "44100",
+        str(path),
+    ]
+    proc = run(cmd)
+    if proc.returncode != 0 or not path.is_file():
+        raise RuntimeError(proc.stderr or "phone sample failed")
+    return path
 
 
 def make_clip(path: Path, seconds: float, size: str, rate: int = 30, freq: int = 440) -> Path:
@@ -207,18 +256,46 @@ def main() -> int:
         pinfo = probe_media(proxy)
         check(max(pinfo.width, pinfo.height) <= 1080, f"proxy {pinfo.width}x{pinfo.height}")
         check(min(pinfo.width, pinfo.height) <= 1080, f"proxy short {pinfo.width}x{pinfo.height}")
+        check(pinfo.has_audio, "proxy keeps audio")
 
         print("9:16 phone encode (DTS sanitize)")
-        phone = make_clip(tmp / "phone.mp4", 1.4, "1080x1920", rate=25)
+        phone = make_phone_clip(tmp / "phone.mp4", 3.0)
         pinfo = probe_media(phone)
         check((pinfo.width, pinfo.height) == (1080, 1920), (pinfo.width, pinfo.height))
         check(not is_heavy_source(pinfo.width, pinfo.height), "1080x1920 not heavy")
+        from videouniq.core.filters import build_filter_complex
+
         pparams = generate_unique_set(pinfo, 1, "hard")[0]
+        graph = build_filter_complex(pinfo, pparams)
+        check("async=1" not in graph and "first_pts=0" not in graph, "no async aresample")
+        check("asetpts=PTS-STARTPTS" in graph, "PTS reset")
+        check("adelay=" in graph and "hue=h=" in graph and "anoisesrc=" in graph, "hard modules")
+        fast = EncoderChoice(
+            kind="cpu",
+            video_codec="libx264",
+            extra=["-preset", "ultrafast", "-crf", "23"],
+            label="CPU ultrafast",
+            gpu_name="",
+        )
         pdest = tmp / "phone_out.mp4"
-        encode_copy(pinfo, pparams, pdest, encoder, x264_threads=2)
+        encode_copy(pinfo, pparams, pdest, fast, x264_threads=2)
         check(pdest.is_file() and pdest.stat().st_size > 1000, pdest)
         pout = probe_media(pdest)
         check(pout.width == 1080 and pout.height == 1920, (pout.width, pout.height))
+        check(pout.has_audio and pout.duration > 2.0, (pout.has_audio, pout.duration))
+
+        print("QSV fallback → CPU")
+        qsv = EncoderChoice(
+            kind="qsv",
+            video_codec="h264_qsv",
+            extra=["-preset", "fast", "-global_quality", "22"],
+            label="Intel Quick Sync",
+            gpu_name="Intel",
+        )
+        qdest = tmp / "phone_qsv.mp4"
+        encode_copy(pinfo, pparams, qdest, qsv, x264_threads=2, allow_cpu_fallback=True)
+        qout = probe_media(qdest)
+        check(qout.has_audio and qout.width == 1080, (qout.width, qout.has_audio))
 
         print("speech-like A/V + 5 Optimal + master")
         speech = make_clip(tmp / "speech.mp4", 8.0, "1280x720", rate=30, freq=180)

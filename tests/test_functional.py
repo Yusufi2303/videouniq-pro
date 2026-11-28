@@ -22,7 +22,9 @@ from videouniq.core.pipeline import (
     JobCancelled,
     container_output_args,
     encode_copy,
+    encode_stderr_failed,
     extract_preview,
+    ffmpeg_error_tail,
     file_md5,
     finalize_filter_graph,
     uniquize_source,
@@ -260,6 +262,9 @@ def main() -> int:
                 check(all(1.0 <= p.stereo_delay_ms <= 4.01 for p in params), "hard stereo delay TZ")
                 check(all(abs(p.tempo - 1.0) <= 0.015 + 1e-6 for p in params), "hard tempo TZ")
                 check(all(abs(p.pitch_semitones) <= 0.2 + 1e-6 for p in params), "hard pitch TZ")
+                graph = build_filter_complex(info, params[0])
+                check("async=1" not in graph and "first_pts=0" not in graph, "no async aresample")
+                check("asetpts=PTS-STARTPTS" in graph, "audio PTS reset after pitch")
 
         flags = ModuleFlags(
             metadata=True,
@@ -444,6 +449,26 @@ def main() -> int:
         check(len({p.overlay_seed for p in params}) == 24, "overlay seed collision")
         check(len({p.noise_seed for p in params}) == 24, "audio noise seed collision")
 
+    def t_stderr_gate() -> None:
+        x264 = "\n".join(
+            [
+                "x264 [info]: 264 - core 164",
+                "x264 [info]: using cpu capabilities",
+                "frame I: 12 Avg QP:17.12  size:  4821",
+                "kb/s:1847.21",
+                "[mp4 @ 0x1] Non-monotonic DTS in output stream 0:1; previous: 9223372036854775148, current: 914",
+                "[aost#0:1] failed to avoid negative timestamp -9223372036854772631",
+                "Error muxing a packet",
+                "Conversion failed!",
+            ]
+        )
+        tail = ffmpeg_error_tail(x264)
+        check("kb/s" not in tail and "frame I:" not in tail, tail)
+        check("Conversion failed" in tail, tail)
+        check("922337203685477" in tail, tail)
+        check(encode_stderr_failed(x264), "stderr after x264 stats is still failure")
+        check(not encode_stderr_failed("x264 [info]: kb/s:12.0\n"), "clean x264 stats ok")
+
     step("folder collect (drag-drop equivalent)", t_collect)
     step("probe + first-frame preview", t_probe_preview)
     step("unique params Light/Optimal/Hard/Manual", t_presets_unique)
@@ -455,6 +480,7 @@ def main() -> int:
     step("GPU/CPU encoder setting", t_hw_cpu)
     step("MD5 + perceptual hash + Optimal quality", t_perceptual_and_quality)
     step("no duplicate param sets (24 copies)", t_many_fingerprints)
+    step("ffmpeg stderr after x264 stats is failure", t_stderr_gate)
 
     print("TMP", tmp)
     if failures:

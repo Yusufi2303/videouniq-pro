@@ -101,14 +101,19 @@ def _seconds_from_ts(value: str) -> float:
 
 
 def demux_sanitize_args() -> list[str]:
-    """Rebuild timestamps from phone MP4s (VFR, edit lists, non-monotonic DTS)."""
+    """Rebuild timestamps from phone MP4s (VFR, edit lists). Do not use +igndts:
+
+    discarding DTS makes audio PTS = AV_NOPTS_VALUE (−2^63); x264 then finishes
+    and mux dies with Conversion failed.
+    """
     return [
         "-fflags",
-        "+genpts+igndts+discardcorrupt",
+        "+genpts+discardcorrupt",
         "-ignore_editlist",
         "1",
         "-avoid_negative_ts",
         "make_zero",
+        "-start_at_zero",
     ]
 
 
@@ -123,14 +128,79 @@ def wrap_input_files(paths: list[str]) -> list[str]:
     return args
 
 
+_X264_NOISE = (
+    "mb I ",
+    "mb P ",
+    "mb B ",
+    "i16 v,h,dc,p",
+    "i8 v,h,dc",
+    "i4 v,h,dc",
+    "i8c dc,h,v,p",
+    "ref P L0",
+    "ref B L0",
+    "ref B L1",
+    "coded y,uvDC",
+    "direct mvs",
+    "8x8 transform",
+    "Weighted P-Frames",
+    "consecutive B-frames",
+    "frame I:",
+    "frame P:",
+    "frame B:",
+    "kb/s:",
+    "Qavg:",
+    "using cpu capabilities",
+    "profile High",
+    "264 - core",
+    "frame=  ",
+    "No accelerated colorspace",
+    "[swscaler @",
+)
+
+
+def ffmpeg_error_tail(stderr: str, limit: int = 30) -> str:
+    """Last useful ffmpeg lines, skipping libx264 stat tables."""
+    keep: list[str] = []
+    for raw in (stderr or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if any(tok in line for tok in _X264_NOISE):
+            continue
+        keep.append(line)
+    if keep:
+        return "\n".join(keep[-limit:])
+    lines = [ln.rstrip() for ln in (stderr or "").splitlines() if ln.strip()]
+    return "\n".join(lines[-limit:])
+
+
+def encode_stderr_failed(stderr: str) -> bool:
+    s = (stderr or "").lower()
+    keys = (
+        "conversion failed",
+        "error while filtering",
+        "error muxing",
+        "failed to avoid negative timestamp",
+        "error submitting a packet",
+        "invalid argument",
+        "error opening",
+        "non-monotonic dts",
+        "922337203685477",
+    )
+    return any(k in s for k in keys)
+
+
 def mux_sanitize_args() -> list[str]:
     return [
         "-fps_mode",
         "cfr",
         "-avoid_negative_ts",
         "make_zero",
+        "-max_interleave_delta",
+        "0",
         "-max_muxing_queue_size",
         "9999",
+        "-shortest",
     ]
 
 
@@ -306,21 +376,29 @@ def encode_copy(
                         progress_cb(frac, "рендер")
                 if line == "progress=end":
                     break
-            code = proc.wait(timeout=30)
+            try:
+                code = proc.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=8)
+                code = -1
+                err_chunks.append("ffmpeg mux timeout after encode\n")
         except JobCancelled:
             if dest.exists():
                 dest.unlink(missing_ok=True)
             raise
         finally:
-            err_thread.join(timeout=2)
+            err_thread.join(timeout=30)
 
-        if code == 0 and dest.is_file() and dest.stat().st_size >= 64:
+        err_text = "".join(err_chunks)
+        ok_file = dest.is_file() and dest.stat().st_size >= 64
+        if code == 0 and ok_file and not encode_stderr_failed(err_text):
             append_padding(dest, params.pad_bytes)
             if progress_cb:
                 progress_cb(1.0, "готово")
             return dest
 
-        last_error = "".join(err_chunks[-12:]).strip() or f"ffmpeg exit {code}"
+        last_error = ffmpeg_error_tail(err_text) or f"ffmpeg exit {code}"
         if dest.exists():
             dest.unlink(missing_ok=True)
         can_retry = (

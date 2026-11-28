@@ -31,6 +31,7 @@ def prepare_runtime() -> None:
     plugins = pyside / "plugins"
     os.environ["QT_PLUGIN_PATH"] = str(plugins)
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(plugins / "platforms")
+    os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
     os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     os.environ.setdefault("PYTHONUTF8", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")

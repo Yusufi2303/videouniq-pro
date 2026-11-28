@@ -142,15 +142,19 @@ def audio_uniquize_filters(media: MediaInfo, params: UniqueParams, end: float | 
             a.append(f"atrim=start={max(0.0, params.trim_start):.4f}")
         a.append("asetpts=PTS-STARTPTS")
 
-    a.append("aresample=48000:async=1:first_pts=0")
+    # Do not use aresample=async=1:first_pts=0 — it writes PTS = -2^63 and
+    # ffmpeg then prints x264 kb/s and dies with Conversion failed on mux.
+    a.append("aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo")
     rate = 48000
     pitch_ratio = 2 ** (params.pitch_semitones / 12.0) if abs(params.pitch_semitones) > 1e-6 else 1.0
     if abs(pitch_ratio - 1.0) > 1e-6:
         a.append(f"asetrate={rate}*{pitch_ratio:.8f}")
-        a.append(f"aresample={rate}:async=1")
+        a.append(f"aresample={rate}")
+        a.append("asetpts=PTS-STARTPTS")
     atempo = params.tempo / pitch_ratio
     if abs(atempo - 1.0) > 1e-4:
         a.append(f"atempo={atempo:.5f}")
+        a.append("asetpts=PTS-STARTPTS")
     if params.highpass_hz:
         a.append(f"highpass=f={params.highpass_hz:.1f}")
     if params.lowpass_hz:
@@ -202,7 +206,7 @@ def uniquize_labeled(
         )
         parts.append(f"{vin}{video_chain}[vbase]")
         parts.append(f"{ov}[ov]")
-        parts.append(f"[vbase][ov]overlay=0:0:format=auto:shortest=1,format=yuv420p[{vout}]")
+        parts.append(f"[vbase][ov]overlay=0:0:format=yuv420:shortest=1,format=yuv420p[{vout}]")
     else:
         parts.append(f"{vin}{video_chain}[{vout}]")
 
@@ -213,7 +217,7 @@ def uniquize_labeled(
         ain = _label(a_in or "0:a")
         aout_name = a_out.strip("[]")
         if params.audio_noise:
-            duration = max(0.25, output_duration(media, params))
+            duration = max(0.25, output_duration(media, params) + 1.0)
             color = "pink" if params.noise_color == "pink" else "white"
             seed = max(1, int(params.noise_seed) & 0x7FFFFFFF)
             parts.append(f"{ain}{audio_chain}[a1]")
@@ -224,7 +228,8 @@ def uniquize_labeled(
                 "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[ano]"
             )
             parts.append(
-                f"[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,volume=1[{aout_name}]"
+                f"[a1][ano]amix=inputs=2:duration=first:dropout_transition=0,"
+                f"volume=1,asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[{aout_name}]"
             )
         else:
             parts.append(f"{ain}{audio_chain}[{aout_name}]")

@@ -21,11 +21,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 
-from videouniq.editor.ops import clip_at_time, timeline_duration
+from videouniq.editor.ops import clip_at_time, packed_starts, timeline_duration
 from videouniq.editor.project import ASPECTS, EditorProject, TextClip
 from videouniq.editor.proxy import ensure_proxy, is_heavy_source
 from videouniq.editor.text_paint import render_text_image, text_fingerprint
@@ -127,9 +128,11 @@ class CanvasWidget(QWidget):
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.frame = QPixmap()
+        self.live_video = False
         self.selected_id = ""
         self._drag = ""
         self._last = QPointF()
@@ -173,11 +176,14 @@ class CanvasWidget(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#0B0D10"))
         rect = self.canvas_rect()
-        p.fillRect(rect, QColor("#111318"))
-        if not self.frame.isNull():
-            p.drawPixmap(rect.toRect(), self.frame)
+        if self.live_video:
+            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+        else:
+            p.fillRect(self.rect(), QColor("#0B0D10"))
+            p.fillRect(rect, QColor("#111318"))
+            if not self.frame.isNull():
+                p.drawPixmap(rect.toRect(), self.frame)
         if self._guides:
             pen = QPen(QColor("#3B82F6"))
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -321,13 +327,17 @@ class PreviewPlayer(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.backend = player_backend()
+        self.backend = "ffmpeg"
         self.project: EditorProject | None = None
         self.playhead = 0.0
         self.playing = False
         self._qt_player = None
+        self._audio = None
+        self._video = None
         self._mpv = None
         self._src = ""
+        self._ignore_pos = False
+        self._pending_local = 0.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -337,7 +347,7 @@ class PreviewPlayer(QWidget):
         cap.setProperty("heading", True)
         top.addWidget(cap)
         top.addStretch(1)
-        self.backend_lab = QLabel(self._backend_label())
+        self.backend_lab = QLabel("")
         self.backend_lab.setStyleSheet("color: #9CA3AF; font-size: 11px;")
         top.addWidget(self.backend_lab)
         self.aspect = QComboBox()
@@ -348,10 +358,20 @@ class PreviewPlayer(QWidget):
         top.addWidget(self.aspect)
         layout.addLayout(top)
 
+        host = QWidget()
+        host.setObjectName("CanvasHost")
+        stack = QStackedLayout(host)
+        stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        self._video_host = QWidget()
+        self._video_host.setStyleSheet("background: #0B0D10;")
+        vh = QVBoxLayout(self._video_host)
+        vh.setContentsMargins(0, 0, 0, 0)
+        stack.addWidget(self._video_host)
         self.canvas = CanvasWidget()
         self.canvas.selection_changed.connect(self.selection_changed.emit)
         self.canvas.text_changed.connect(self.project_changed.emit)
-        layout.addWidget(self.canvas, 1)
+        stack.addWidget(self.canvas)
+        layout.addWidget(host, 1)
 
         controls = QHBoxLayout()
         self.play_btn = QPushButton("▶")
@@ -392,30 +412,34 @@ class PreviewPlayer(QWidget):
         self._init_backend()
 
     def _backend_label(self) -> str:
-        base = {"mpv": "libmpv", "qt": "Qt Multimedia", "ffmpeg": "FFmpeg / Qt"}.get(self.backend, self.backend)
-        return f"{base} · прокси>1080p"
+        if self.backend == "qt":
+            return "Qt Multimedia · звук"
+        return "FFmpeg кадры · без звука"
 
     def _init_backend(self) -> None:
-        if self.backend == "mpv":
-            try:
-                import mpv
+        try:
+            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+            from PySide6.QtMultimediaWidgets import QVideoWidget
 
-                self._mpv = mpv.MPV(vo="null", pause=True, idle=True)
-            except Exception:
-                self.backend = "ffmpeg"
-                self._mpv = None
-        if self.backend == "qt":
-            try:
-                from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-
-                self._qt_player = QMediaPlayer(self)
-                audio = QAudioOutput(self)
-                audio.setVolume(0.0)
-                self._qt_player.setAudioOutput(audio)
-            except Exception:
-                self.backend = "qt_fail"
-                self._qt_player = None
-                self.backend = "ffmpeg"
+            self._video = QVideoWidget(self._video_host)
+            self._video.setAspectRatioMode(Qt.AspectRatioMode.KeepAspectRatio)
+            self._video_host.layout().addWidget(self._video)
+            self._audio = QAudioOutput(self)
+            self._audio.setVolume(0.85)
+            self._audio.setMuted(False)
+            self._qt_player = QMediaPlayer(self)
+            self._qt_player.setAudioOutput(self._audio)
+            self._qt_player.setVideoOutput(self._video)
+            self._qt_player.positionChanged.connect(self._on_pos)
+            self._qt_player.mediaStatusChanged.connect(self._on_status)
+            self.backend = "qt"
+            self.canvas.live_video = True
+        except Exception:
+            self._qt_player = None
+            self._audio = None
+            self._video = None
+            self.backend = "ffmpeg"
+            self.canvas.live_video = False
         self.backend_lab.setText(self._backend_label())
 
     def set_project(self, project: EditorProject) -> None:
@@ -454,8 +478,16 @@ class PreviewPlayer(QWidget):
     def play(self) -> None:
         if self.duration() <= 0:
             return
+        if self.playhead >= self.duration() - 0.05:
+            self.playhead = 0.0
+            self.canvas.playhead = 0.0
         self.playing = True
         self.play_btn.setText("❚❚")
+        if self._qt_player is not None:
+            self._sync_source()
+            self._qt_player.play()
+            self._timer.stop()
+            return
         self._timer.start()
 
     def pause(self) -> None:
@@ -479,7 +511,79 @@ class PreviewPlayer(QWidget):
             self.seek.blockSignals(False)
         self.time_lab.setText(f"{_fmt(self.playhead)} / {_fmt(dur)}")
         self.playhead_changed.emit(self.playhead)
+        if self._qt_player is not None:
+            self._sync_source()
+            self.canvas.update()
+            return
         self.refresh_frame()
+
+    def _on_status(self, status) -> None:
+        if self._qt_player is None:
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+        except Exception:
+            return
+        ready = {
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        }
+        if status in ready:
+            self._ignore_pos = True
+            self._qt_player.setPosition(int(max(0.0, self._pending_local) * 1000))
+            self._ignore_pos = False
+            if self.playing:
+                self._qt_player.play()
+
+    def _sync_source(self) -> None:
+        if self._qt_player is None or self.project is None:
+            return
+        hit = clip_at_time(self.project, self.playhead)
+        if hit is None:
+            return
+        _, clip, local = hit
+        src = self._play_src(clip)
+        if not src or not Path(src).is_file():
+            return
+        self._pending_local = local
+        self._ignore_pos = True
+        if src != self._src:
+            self._src = src
+            self._qt_player.setSource(QUrl.fromLocalFile(src))
+        else:
+            self._qt_player.setPosition(int(max(0.0, local) * 1000))
+        self._ignore_pos = False
+
+    def _on_pos(self, ms: int) -> None:
+        if self._ignore_pos or not self.playing or self.project is None:
+            return
+        hit = clip_at_time(self.project, self.playhead)
+        if hit is None:
+            self.pause()
+            return
+        i, clip, _ = hit
+        starts = packed_starts(self.project.video_clips)
+        local = ms / 1000.0
+        t = starts[i] + max(0.0, local - clip.in_point)
+        if t >= starts[i] + clip.duration() - 0.02:
+            if i + 1 < len(self.project.video_clips):
+                self.playhead = packed_starts(self.project.video_clips)[i + 1]
+                self._sync_source()
+                self._qt_player.play()
+            else:
+                self.pause()
+                return
+        else:
+            self.playhead = min(t, self.duration())
+        self.canvas.playhead = self.playhead
+        dur = self.duration()
+        if dur > 0:
+            self.seek.blockSignals(True)
+            self.seek.setValue(int(self.playhead / dur * 1000))
+            self.seek.blockSignals(False)
+        self.time_lab.setText(f"{_fmt(self.playhead)} / {_fmt(dur)}")
+        self.playhead_changed.emit(self.playhead)
+        self.canvas.update()
 
     def _seek_frac(self, value: int) -> None:
         dur = self.duration()
@@ -536,6 +640,10 @@ class PreviewPlayer(QWidget):
         if self.project is None:
             self.canvas.set_frame(None)
             return
+        if self._qt_player is not None:
+            self._sync_source()
+            self.canvas.update()
+            return
         hit = clip_at_time(self.project, self.playhead)
         rect = self.canvas.canvas_rect()
         size = (max(160, int(rect.width())), max(160, int(rect.height())))
@@ -563,14 +671,6 @@ class PreviewPlayer(QWidget):
         self._last_grab_t = local
         self._last_grab_src = src
         QThreadPool.globalInstance().start(GrabTask(src, local, size, self._grab_bridge))
-        if self._qt_player is not None and src != self._src:
-            self._src = src
-            self._qt_player.setSource(QUrl.fromLocalFile(src))
-        if self._mpv is not None and src:
-            try:
-                self._mpv.command("seek", local, "absolute")
-            except Exception:
-                pass
 
     def _on_grab(self, pix, src: str, seconds: float, _w: int, _h: int) -> None:
         if isinstance(src, str) and src.startswith("proxy:"):

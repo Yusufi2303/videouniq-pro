@@ -247,8 +247,13 @@ def main() -> int:
     shot(win, "live_05_scale_rotate.png")
 
     # Player: space / arrows / aspect
+    check(win.editor.player.backend == "qt", f"player backend={win.editor.player.backend}")
+    check(win.editor.player._audio is not None and not win.editor.player._audio.isMuted(), "audio unmuted")
+    check("звук" in win.editor.player.backend_lab.text(), win.editor.player.backend_lab.text())
     click(win.editor.player.play_btn)
     pump(250)
+    check(win.editor.player.playing, "play starts")
+    check(not win.editor.player._timer.isActive(), "qt play is not ffmpeg stills")
     click(win.editor.player.play_btn)
     click(win.editor.player.next_btn)
     pump(80)
