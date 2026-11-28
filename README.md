@@ -2,7 +2,7 @@
 
 Пакетная уникализация видео без нейросетей и визуальный редактор (CapCut-стиль). Windows 10/11 x64 (портативная папка с `.exe`) и Linux для разработки.
 
-Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (Qt Multimedia QMediaPlayer, запасные кадры FFmpeg). Версия: **2.1.5**.
+Стек: Python 3.11+, PySide6, FFmpeg/FFprobe (Qt Multimedia QMediaPlayer, запасные кадры FFmpeg). Версия: **2.2.0**.
 
 ## Запуск на Linux (демо / разработка)
 
@@ -22,6 +22,8 @@ PYTHONPATH=src python -m videouniq
 - GPU: `filter_complex` + `h264_nvenc` / QSV / AMF, принудительный `format=yuv420p` перед энкодером, fallback на `libx264`.
 - Кэш: `%LOCALAPPDATA%\VideoUniqPro\cache` (прокси, PNG текста, превью, автосейв). Очистка при выходе (кроме последнего несохранённого `.vup`), мусор старше 24 ч при старте. В настройках: «Размер кэша: N МБ» и «Очистить кэш сейчас».
 - Уникализатор: GOP, stereo delay, hue, notch EQ — без ослабления. Один проход FFmpeg: монтаж + уникализация.
+- Отчёт уникальности: реальные MD5 (hashlib) и ffprobe, модалка после копий; глубокий анализ aHash + SSIM.
+- Авто-энкодер: NVIDIA NVENC раньше Intel QSV, если есть оба (ноутбуки RTX + iGPU).
 
 ## Windows
 

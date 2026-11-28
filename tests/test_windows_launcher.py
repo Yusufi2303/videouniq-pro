@@ -109,7 +109,7 @@ def test_zip_contains_python_runtime_and_src_on_pth() -> None:
     assert "../src" in pth.replace("\\", "/")
     assert "sys.path.insert" in boot
     assert "QT_MEDIA_BACKEND" in boot
-    assert '__version__ = "2.1.5"' in init
+    assert '__version__ = "2.2.0"' in init
     assert pyw.file_size > 50_000
     assert pye.file_size > 50_000
     assert exe.file_size > 20_000

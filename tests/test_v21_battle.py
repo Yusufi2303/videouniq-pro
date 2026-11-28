@@ -271,11 +271,12 @@ def main() -> int:
         check("asetpts=PTS-STARTPTS" in graph, "PTS reset")
         check("adelay=" in graph and "hue=h=" in graph and "anoisesrc=" in graph, "hard modules")
         check(":d=" in graph, "overlay duration capped")
-        from videouniq.core.hardware import recommended_encode_workers
+        from videouniq.core.hardware import auto_encoder_priority, recommended_encode_workers
         from videouniq.core.pipeline import is_oom_error
         from videouniq.editor.proxy import ensure_stream_copy
 
         check(recommended_encode_workers() in (1, 2), recommended_encode_workers())
+        check(auto_encoder_priority()[0] == "nvenc", "NVIDIA before Intel QSV")
         check(is_oom_error("Error while filtering: Cannot allocate memory"), "oom detect")
         copied = Path(ensure_stream_copy(phone))
         cinfo = probe_media(copied)
@@ -333,6 +334,13 @@ def main() -> int:
             vd, ad = av_durations(dest)
             check(abs(vd - ad) < 0.40, f"A/V sync copy {i} v={vd:.3f} a={ad:.3f}")
         check(len(set(hashes)) == 5, hashes)
+        from videouniq.core.auditor import quick_audit, save_report
+
+        ureport = quick_audit(speech, out)
+        save_report(ureport)
+        check(ureport.verdict in {"unique", "warn"}, ureport.verdict_label)
+        check(len(ureport.copies) == 5, len(ureport.copies))
+        check(len(ureport.copies[0].md5) == 32, "auditor md5 is real hashlib")
         master_spec = build_edit_and_uniquize(loaded, None)
         master = out / "master.mp4"
         encode_copy(

@@ -250,6 +250,8 @@ def main() -> int:
     check(win.editor.player.backend == "qt", f"player backend={win.editor.player.backend}")
     check(win.editor.player._audio is not None and not win.editor.player._audio.isMuted(), "audio unmuted")
     check("звук" in win.editor.player.backend_lab.text(), win.editor.player.backend_lab.text())
+    check(win.editor.player._video is not None, "QVideoWidget native surface")
+    check(win.editor.player.canvas.live_video, "canvas overlay is transparent over video")
     click(win.editor.player.play_btn)
     pump(250)
     check(win.editor.player.playing, "play starts")
@@ -312,6 +314,34 @@ def main() -> int:
     copies = list(Path(done[0].output_dir).glob("video_*.mp4")) if done and done[0].output_dir else []
     check(len(copies) >= 1, f"files {copies}")
     shot(win, "live_08_uniquize_done.png")
+    from videouniq.core.auditor import load_report
+    from videouniq.ui.uniqueness_dialog import UniquenessDialog
+
+    card = win.queue._cards.get(done[0].item_id) if done else None
+    check(card is not None and card.report_btn.isVisible(), "Отчёт уникальности on card")
+    loaded = load_report(done[0].output_dir) if done and done[0].output_dir else None
+    check(loaded is not None and loaded.verdict in {"unique", "warn"}, loaded.verdict if loaded else None)
+    check(loaded is not None and len(loaded.copies[0].md5) == 32, "real md5 in uniqueness.json")
+    check(loaded is not None and "00000000" not in loaded.copies[0].md5, loaded.copies[0].md5 if loaded else "")
+    dlg = UniquenessDialog(done[0].path, done[0].output_dir, win)
+    dlg.show()
+    dlg.raise_()
+    pump(500)
+    check(dlg.table.rowCount() >= 4, f"report rows {dlg.table.rowCount()}")
+    check(dlg.table.columnCount() >= 2, f"report cols {dlg.table.columnCount()}")
+    shot(win, "v2.2-uniqueness-report.png")
+    SHOT.mkdir(parents=True, exist_ok=True)
+    STORE_SHOT.mkdir(parents=True, exist_ok=True)
+    dlg_shot = SHOT / "v2.2-uniqueness-modal.png"
+    dlg.grab().save(str(dlg_shot))
+    try:
+        import shutil
+
+        shutil.copy2(dlg_shot, STORE_SHOT / dlg_shot.name)
+    except Exception:
+        pass
+    dlg.close()
+    pump(80)
 
     # Return to editor
     if done:
@@ -380,17 +410,13 @@ def main() -> int:
     pump(1600)
     check(win.editor.player.playing, "native 1080x1920 play starts")
     check(not win.editor.player._timer.isActive(), "native play is QMediaPlayer not FFmpeg stills")
+    check(win.editor.player._video is not None and win.editor.player._video.isVisible(), "QVideoWidget visible")
+    check(win.editor.player.canvas.live_video, "no QVideoSink pixmap flash")
     ph = win.editor.player.playhead
     qt_pos = int(win.editor.player._qt_player.position()) if win.editor.player._qt_player else 0
     check(ph - t0 >= 0.35 or qt_pos - pos0 >= 300, f"clock moved playhead={ph:.2f} qt={qt_pos}ms")
-    frame = win.editor.player.canvas.frame
-    check(not frame.isNull(), "decoded native frame present")
-    if not frame.isNull():
-        check(
-            frame.width() >= 1000 and frame.height() >= 1700,
-            f"frame is native not widget-proxy {frame.width()}x{frame.height()}",
-        )
-    shot(win, "v2.1.5-player-native-1080x1920.png")
+    check(not win.editor.player._proxy_of.get(str(phone)), "1080x1920 not proxied")
+    shot(win, "v2.2-player-qvideowidget.png")
     click(win.editor.player.play_btn)
     pump(80)
     win.close()

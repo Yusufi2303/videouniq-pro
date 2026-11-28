@@ -45,8 +45,23 @@ def list_ffmpeg_encoders() -> set[str]:
     return found
 
 
+def _nvidia_smi_bin() -> str:
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    for candidate in (
+        pf / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe",
+        Path(r"C:\Windows\System32\nvidia-smi.exe"),
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
 def _probe_nvenc_name() -> str:
-    nvidia = shutil.which("nvidia-smi")
+    nvidia = _nvidia_smi_bin()
     if not nvidia:
         return ""
     try:
@@ -66,6 +81,25 @@ def _win_dll(name: str) -> bool:
             if Path(root, sub, name).is_file():
                 return True
     return False
+
+
+def nvidia_likely() -> bool:
+    """True when an NVIDIA GPU is installed, even if nvidia-smi is not on PATH."""
+    if _probe_nvenc_name():
+        return True
+    if Path("/dev/nvidia0").exists():
+        return True
+    if _win_dll("nvEncodeAPI64.dll") or _win_dll("nvcuda.dll") or _win_dll("nvapi64.dll"):
+        return True
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    if (pf / "NVIDIA Corporation").is_dir():
+        return True
+    return False
+
+
+def auto_encoder_priority() -> tuple[str, ...]:
+    """Auto always tries NVIDIA before Intel QSV (RTX + iGPU laptops)."""
+    return ("nvenc", "qsv", "amf")
 
 
 def _can_encode(codec: str, extra: list[str]) -> bool:
@@ -105,12 +139,7 @@ def _can_encode(codec: str, extra: list[str]) -> bool:
 
 def _gpu_present(kind: str) -> bool:
     if kind == "nvenc":
-        return bool(
-            _probe_nvenc_name()
-            or Path("/dev/nvidia0").exists()
-            or _win_dll("nvEncodeAPI64.dll")
-            or _win_dll("nvcuda.dll")
-        )
+        return nvidia_likely()
     if kind == "qsv":
         return (
             Path("/dev/dri/renderD128").exists()
@@ -238,9 +267,16 @@ def detect_hardware(preference: str = "auto") -> EncoderChoice:
                     return item
         return cpu
 
-    for item in candidates:
-        # Skip encode probe when the GPU is clearly absent (avoids 16s timeouts on CI).
-        if not _gpu_present(item.kind):
+    by_kind = {item.kind: item for item in candidates}
+    # NVIDIA before Intel QSV when both exist (RTX 3050 + iGPU: Auto used to pick QSV).
+    for kind in auto_encoder_priority():
+        item = by_kind.get(kind)
+        if item is None:
+            continue
+        if kind == "nvenc":
+            if not _gpu_present("nvenc"):
+                continue
+        elif not _gpu_present(item.kind):
             continue
         if _can_encode(item.video_codec, item.extra):
             return item

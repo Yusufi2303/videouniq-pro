@@ -46,6 +46,8 @@ from videouniq.ui.queue_view import QueueView
 from videouniq.ui.right_panel import RightPanel
 from videouniq.ui.sidebar import Sidebar
 from videouniq.ui.theme import apply_theme
+from videouniq.ui.uniqueness_dialog import UniquenessDialog
+from videouniq.core.auditor import quick_audit, save_report
 
 
 class ProbeBridge(QObject):
@@ -161,6 +163,8 @@ class MainWindow(QMainWindow):
         self.queue.remove_requested.connect(self.remove_item)
         self.queue.open_requested.connect(self._open_item_folder)
         self.queue.return_requested.connect(self._return_to_editor)
+        self.queue.report_requested.connect(self._open_uniqueness)
+        self.history_page.report_requested.connect(self._open_uniqueness_path)
         self.right.start_requested.connect(self.start_render)
         self.right.stop_requested.connect(self.controller.stop)
         self.right.save_preset_requested.connect(self._save_custom_preset)
@@ -209,6 +213,10 @@ class MainWindow(QMainWindow):
         self.sidebar.set_hardware(f"GPU: {gpu}\n{choice.label}")
         self.render_page.set_hardware_info(text)
         self.logs_page.append(f"Аппаратный энкодер: {choice.label}")
+        if choice.kind == "nvenc":
+            self.logs_page.append("Авто: NVIDIA NVENC имеет приоритет над Intel QSV")
+        elif choice.kind == "qsv":
+            self.logs_page.append("Intel QSV: NVIDIA NVENC недоступен или не прошёл проверку")
         self.logs_page.append(
             f"RAM {ram_gb():.0f} ГБ · потоков уникализации: {self.render_page.thread_count()} "
             f"(рекомендуется {recommended_encode_workers()})"
@@ -302,6 +310,36 @@ class MainWindow(QMainWindow):
         item = self._find(item_id)
         if item and item.output_dir:
             open_path(item.output_dir)
+
+    def _open_uniqueness(self, item_id: str) -> None:
+        item = self._find(item_id)
+        if item is None or not item.output_dir:
+            QMessageBox.information(self, __app_name__, "Сначала завершите уникализацию.")
+            return
+        self._open_uniqueness_path(item.path, item.output_dir)
+
+    def _open_uniqueness_path(self, source: str, output_dir: str) -> None:
+        folder = output_dir
+        p = Path(output_dir)
+        if p.is_file():
+            folder = str(p.parent)
+            if not source:
+                source = str(p)
+        if not Path(folder).is_dir():
+            QMessageBox.warning(self, __app_name__, "Папка с копиями не найдена.")
+            return
+        src = source or folder
+        if Path(src).suffix.lower() == ".vup":
+            from videouniq.editor.project import EditorProject
+
+            try:
+                proj = EditorProject.load(src)
+                if proj.video_clips:
+                    src = proj.video_clips[0].source_path
+            except Exception:
+                pass
+        dlg = UniquenessDialog(src, folder, self)
+        dlg.exec()
 
     def _find(self, item_id: str) -> FileItem | None:
         return next((it for it in self.items if it.item_id == item_id), None)
@@ -415,6 +453,20 @@ class MainWindow(QMainWindow):
             item.status = FileStatus.DONE
             item.progress = 1.0
             item.message = "Готово"
+            if item.output_dir:
+                try:
+                    source = item.path
+                    if item.kind == "project" and item.project_dict:
+                        clips = item.project_dict.get("video_clips") or []
+                        if clips and clips[0].get("source_path"):
+                            source = str(clips[0]["source_path"])
+                    report = quick_audit(source, item.output_dir)
+                    save_report(report)
+                    self.logs_page.append(
+                        f"Отчёт уникальности: {report.verdict_label} ({report.elapsed_ms:.0f} мс)"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.logs_page.append(f"Отчёт уникальности не собран: {exc}")
         elif self.controller._stop.is_set():
             item.status = FileStatus.CANCELLED
         elif item.error:
@@ -436,6 +488,7 @@ class MainWindow(QMainWindow):
                         Path(item.path).name,
                         item.output_dir,
                         copies=item.copies_done,
+                        extra={"source": item.path},
                     )
             self.history_page.reload()
         self._refresh_queue()

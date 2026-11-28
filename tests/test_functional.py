@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from videouniq.core.filters import build_filter_complex
-from videouniq.core.hardware import detect_hardware
+from videouniq.core.hardware import auto_encoder_priority, detect_hardware
 from videouniq.core.metadata import metadata_pairs
 from videouniq.core.params import ManualRanges, ModuleFlags, flags_for_preset, ranges_for_preset
 from videouniq.core.pipeline import (
@@ -396,6 +396,7 @@ def main() -> int:
         cpu = detect_hardware("cpu")
         check(cpu.kind == "cpu" and cpu.video_codec == "libx264", cpu)
         check(auto.video_codec in {"libx264", "h264_nvenc", "h264_qsv", "h264_amf"}, auto)
+        check(auto_encoder_priority() == ("nvenc", "qsv", "amf"), auto_encoder_priority())
         graph, vmap = finalize_filter_graph("[0:v]eq=contrast=1.01,crop=64:64:0:0[vout]")
         check("format=yuv420p[v420]" in graph, graph)
         check(vmap == "[v420]", vmap)

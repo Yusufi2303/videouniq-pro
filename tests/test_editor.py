@@ -365,7 +365,9 @@ def t_ui_surfaces() -> None:
     check(player._qt_player is not None and player._audio is not None, "QMediaPlayer+QAudioOutput")
     check(abs(float(player._audio.volume()) - 0.85) < 0.02, player._audio.volume())
     check(not player._audio.isMuted(), "audio unmuted")
-    check(player._sink is not None, "QVideoSink native frames")
+    check(player._video is not None, "QVideoWidget native surface")
+    check(player.canvas.live_video, "overlay does not paint video frames")
+    check(player.canvas.objectName() == "CanvasOverlay", player.canvas.objectName())
     check("звук" in player.backend_lab.text(), player.backend_lab.text())
     dummy = VideoClip(source_path="01.mp4", in_point=0, out_point=8.0, source_duration=8.0, source_width=1080, source_height=1920)
     win.editor.project.video_clips = [dummy]
